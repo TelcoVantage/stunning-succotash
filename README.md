@@ -32,39 +32,52 @@ holds these permissions **in the division you report on** (or all divisions):
 | `directory:user:view` | agent names, skills, languages |
 | `authorization:division:view` | division lookup |
 
-### Credentials
-The client id and secret are **embedded in the script**: open `Get-GenesysPriorityCallReport.ps1` and
-fill in `$EmbeddedClientId`, `$EmbeddedClientSecret` (and optionally `$EmbeddedRegion`) at the top.
-Anyone who can read the file can use those credentials, so restrict access to the file and keep the
-OAuth client's role read-only. `-ClientId` / `-ClientSecret` on the command line override the embedded
-values; the `GENESYS_CLIENT_ID` / `GENESYS_CLIENT_SECRET` environment variables are used only when
-neither is set.
+### Embedded settings
+Open `Get-GenesysPriorityCallReport.ps1` and fill in the block at the top:
 
-### Region
-Pass the login/API domain of your org with `-Region`, e.g. `mypurecloud.com`, `mypurecloud.ie`,
-`mypurecloud.com.au`, `mypurecloud.de`, `mypurecloud.jp`, `usw2.pure.cloud`, `cac1.pure.cloud`,
-`euw2.pure.cloud`, `apne2.pure.cloud`, `aps1.pure.cloud`, `sae1.pure.cloud`, `mec1.pure.cloud`.
+```powershell
+$EmbeddedClientId     = 'PASTE-YOUR-CLIENT-ID-HERE'
+$EmbeddedClientSecret = 'PASTE-YOUR-CLIENT-SECRET-HERE'
+$EmbeddedRegion       = 'mypurecloud.com.au'          # Australia (Sydney)
+$EmbeddedDivisionId   = 'PASTE-YOUR-DIVISION-ID-HERE'
+$DefaultReportDays    = 5                             # default window: last 5 days
+```
+
+Anyone who can read the file can use those credentials, so restrict access to the file and keep the
+OAuth client's role read-only. Command-line parameters (`-ClientId`, `-ClientSecret`, `-Region`,
+`-DivisionId`/`-DivisionName`, `-StartDate`/`-EndDate`) override the embedded values when given.
+
+The division id is the GUID shown in the URL on Admin > Account Settings > Divisions, or from
+`GET /api/v2/authorization/divisions` in the API Explorer.
+
+Other regions, if ever needed: `mypurecloud.com`, `mypurecloud.ie`, `mypurecloud.de`, `mypurecloud.jp`,
+`usw2.pure.cloud`, `cac1.pure.cloud`, `euw2.pure.cloud`, `apne2.pure.cloud`, `aps1.pure.cloud`,
+`sae1.pure.cloud`, `mec1.pure.cloud`.
 
 ---
 
 ## 2. Running it
 
+With everything embedded, the last 5 days for the embedded division:
+
 ```powershell
-.\Get-GenesysPriorityCallReport.ps1 `
-    -Region       'mypurecloud.ie' `
-    -DivisionName 'Customer Service' `
-    -StartDate    '2026-09-01' `
-    -EndDate      '2026-09-08' `
-    -OutputPath   'C:\Temp\PriorityAudit.csv'
+.\Get-GenesysPriorityCallReport.ps1
+```
+
+Or with an explicit window and output file:
+
+```powershell
+.\Get-GenesysPriorityCallReport.ps1 -StartDate '2026-09-01' -EndDate '2026-09-08' -OutputPath 'C:\Temp\PriorityAudit.csv'
 ```
 
 Useful options
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `-DivisionId` | | alternative to `-DivisionName` |
+| `-DivisionId` / `-DivisionName` | embedded division id | report on a different division |
+| `-Region` | `mypurecloud.com.au` | Genesys region domain |
 | `-QueueNames 'VIP*','Sales'` | all queues | wildcard filter on queue name |
-| `-StartDate` / `-EndDate` | last 7 days | local time, `EndDate` exclusive |
+| `-StartDate` / `-EndDate` | last 5 days | local time, `EndDate` exclusive |
 | `-FlagIdleStretchSeconds` | 15 | flag when an eligible agent was idle this long *continuously* during the wait |
 | `-ChunkHours` | 24 | analytics query window size (keeps every query inside API limits) |
 | `-MaxNamesPerCell` | 15 | cap for agent-name lists in a cell |

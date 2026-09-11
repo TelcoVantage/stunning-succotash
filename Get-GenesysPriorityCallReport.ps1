@@ -46,15 +46,16 @@
     GENESYS_CLIENT_SECRET. Passing the parameters overrides both.
 
 .PARAMETER Region
-    Genesys Cloud region domain, e.g. mypurecloud.com, mypurecloud.ie, mypurecloud.com.au,
+    Genesys Cloud region domain. Defaults to the embedded $EmbeddedRegion (mypurecloud.com.au, Australia).
+    Others: mypurecloud.com, mypurecloud.ie,
     mypurecloud.de, mypurecloud.jp, usw2.pure.cloud, cac1.pure.cloud, euw2.pure.cloud, apne2.pure.cloud,
     aps1.pure.cloud, sae1.pure.cloud, use2.us-gov-pure.cloud, mec1.pure.cloud
 
 .PARAMETER DivisionName / DivisionId
-    Division to report on. One of the two is required.
+    Division to report on. Defaults to the embedded $EmbeddedDivisionId; either parameter overrides it.
 
 .PARAMETER StartDate / EndDate
-    Local date/time range (EndDate exclusive). Default: last 7 days.
+    Local date/time range (EndDate exclusive). Default: the last $DefaultReportDays days (5) up to now.
 
 .PARAMETER QueueNames
     Optional list of queue names (wildcards allowed) to restrict the report to.
@@ -77,9 +78,12 @@
     Optional overrides of https://api.<Region> and https://login.<Region>/oauth/token (for proxies or testing).
 
 .EXAMPLE
-    # credentials embedded in the script
-    .\Get-GenesysPriorityCallReport.ps1 -Region mypurecloud.ie -DivisionName 'Customer Service' `
-        -StartDate '2026-09-01' -EndDate '2026-09-08' -OutputPath C:\Temp\PriorityAudit.csv
+    # everything embedded (credentials, Australia region, division, last 5 days):
+    .\Get-GenesysPriorityCallReport.ps1
+
+.EXAMPLE
+    # explicit dates / output path, embedded credentials + division
+    .\Get-GenesysPriorityCallReport.ps1 -StartDate '2026-09-01' -EndDate '2026-09-08' -OutputPath C:\Temp\PriorityAudit.csv
 
 .EXAMPLE
     .\Get-GenesysPriorityCallReport.ps1 -Region mypurecloud.com -DivisionId 8b1c... -QueueNames 'Sales*','VIP Line'
@@ -88,7 +92,7 @@
 param(
     [string]$ClientId,
     [string]$ClientSecret,
-    [string]$Region = 'mypurecloud.com',
+    [string]$Region,
     [string]$DivisionName,
     [string]$DivisionId,
     [datetime]$StartDate,
@@ -111,7 +115,9 @@ $ErrorActionPreference = 'Stop'
 # =====================================================================================================
 $EmbeddedClientId     = 'PASTE-YOUR-CLIENT-ID-HERE'
 $EmbeddedClientSecret = 'PASTE-YOUR-CLIENT-SECRET-HERE'
-$EmbeddedRegion       = ''   # optional, e.g. 'mypurecloud.ie' - overrides the -Region default when set
+$EmbeddedRegion       = 'mypurecloud.com.au'     # Australia (Sydney) region - used unless -Region is passed
+$EmbeddedDivisionId   = 'PASTE-YOUR-DIVISION-ID-HERE'   # used unless -DivisionId / -DivisionName is passed
+$DefaultReportDays    = 5                        # default window: last 5 days (used unless -StartDate/-EndDate passed)
 
 # =====================================================================================================
 # region Helpers (all CLM-safe)
@@ -387,11 +393,14 @@ if (-not $ClientSecret) { $ClientSecret = $env:GENESYS_CLIENT_SECRET }
 if (-not $ClientId -or -not $ClientSecret) {
     throw 'No credentials: set $EmbeddedClientId / $EmbeddedClientSecret at the top of the script, or pass -ClientId / -ClientSecret.'
 }
-if ($EmbeddedRegion -ne '' -and -not $PSBoundParameters.ContainsKey('Region')) { $Region = $EmbeddedRegion }
-if (-not $DivisionName -and -not $DivisionId) { throw 'Specify -DivisionName or -DivisionId.' }
+if (-not $Region -and $EmbeddedRegion -ne '') { $Region = $EmbeddedRegion }
+if (-not $Region) { throw 'No region: set $EmbeddedRegion at the top of the script, or pass -Region.' }
+if (-not $DivisionName -and -not $DivisionId -and $EmbeddedDivisionId -ne '' -and $EmbeddedDivisionId -notlike 'PASTE-YOUR-*') { $DivisionId = $EmbeddedDivisionId }
+if (-not $DivisionName -and -not $DivisionId) { throw 'No division: set $EmbeddedDivisionId at the top of the script, or pass -DivisionId / -DivisionName.' }
 
+if ($DefaultReportDays -lt 1) { $DefaultReportDays = 5 }
 if ($EndDate -eq $null -or $EndDate -eq [datetime]'0001-01-01') { $EndDate = Get-Date }
-if ($StartDate -eq $null -or $StartDate -eq [datetime]'0001-01-01') { $StartDate = $EndDate.AddDays(-7) }
+if ($StartDate -eq $null -or $StartDate -eq [datetime]'0001-01-01') { $StartDate = $EndDate.AddDays(0 - $DefaultReportDays) }
 if ($StartDate -ge $EndDate) { throw 'StartDate must be before EndDate.' }
 if ($ChunkHours -lt 1) { $ChunkHours = 24 }
 if ($ChunkHours -gt 168) { $ChunkHours = 168 }
