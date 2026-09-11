@@ -15,6 +15,8 @@ const A = 'user-a', B = 'user-b', C = 'user-c';
 // c3: prio 0, no skill,  enters 10:00:40, answered by B 10:01:00, handled until 10:01:50
 // c4: prio 0, no skill,  enters 10:03:00, abandoned 10:03:20 ; C (no skill) idle whole time -> eligible idle
 // c5: prio 0, no skill,  enters 10:10:00, answered by A 10:10:02 ; conversation GET returns 404 (purged)
+// c6: prio 100, no skill, enters 10:20:00, answered by C 10:20:40  (older, lower priority)
+// c7: prio 400, no skill, enters 10:20:10, answered by A 10:20:20  -> overtakes c6 = PRIORITY HONOURED
 const T = (hms) => `2026-09-02T${hms}.000Z`;
 
 function seg(type, start, end, extra) { return Object.assign({ segmentType: type, segmentStart: T(start), segmentEnd: T(end) }, extra || {}); }
@@ -39,8 +41,10 @@ const conversations = [
   conv('c3', '10:00:40', '10:01:50', seg('interact', '10:00:40', '10:01:00', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(B, '10:00:58', '10:01:00', '10:01:50')]),
   conv('c4', '10:03:00', '10:03:20', seg('interact', '10:03:00', '10:03:20', { queueId: Q1, disconnectType: 'client' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, []),
   conv('c5', '10:10:00', '10:12:00', seg('interact', '10:10:00', '10:10:02', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:10:00', '10:10:02', '10:12:00')]),
+  conv('c6', '10:20:00', '10:24:00', seg('interact', '10:20:00', '10:20:40', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(C, '10:20:38', '10:20:40', '10:24:00')]),
+  conv('c7', '10:20:10', '10:25:00', seg('interact', '10:20:10', '10:20:20', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:20:18', '10:20:20', '10:25:00')]),
 ];
-const priorities = { c1: 0, c2: 5, c3: 0, c4: 0 }; // c5 -> 404
+const priorities = { c1: 0, c2: 5, c3: 0, c4: 0, c6: 100, c7: 400 }; // c5 -> 404
 
 function convDetail(id) {
   if (!(id in priorities)) return null;
@@ -58,9 +62,9 @@ const users = {
 };
 function rs(status, start, end) { return { routingStatus: status, startTime: T(start), endTime: end ? T(end) : undefined }; }
 const routing = {
-  [A]: [rs('IDLE', '09:00:00', '10:00:02'), rs('INTERACTING', '10:00:02', '10:05:00'), rs('IDLE', '10:05:00', '10:10:00'), rs('INTERACTING', '10:10:00', '10:12:00'), rs('OFF_QUEUE', '10:12:00', null)],
+  [A]: [rs('IDLE', '09:00:00', '10:00:02'), rs('INTERACTING', '10:00:02', '10:05:00'), rs('IDLE', '10:05:00', '10:10:00'), rs('INTERACTING', '10:10:00', '10:20:18'), rs('IDLE', '10:20:18', '10:20:19'), rs('INTERACTING', '10:20:19', '10:25:00'), rs('OFF_QUEUE', '10:25:00', null)],
   [B]: [rs('IDLE', '10:00:00', '10:00:58'), rs('INTERACTING', '10:00:58', '10:01:50'), rs('IDLE', '10:01:50', '10:01:57'), rs('INTERACTING', '10:01:57', '10:06:00'), rs('OFF_QUEUE', '10:06:00', null)],
-  [C]: [rs('IDLE', '09:30:00', '10:30:00'), rs('OFF_QUEUE', '10:30:00', null)],
+  [C]: [rs('IDLE', '09:30:00', '10:15:00'), rs('INTERACTING', '10:15:00', '10:20:37'), rs('IDLE', '10:20:37', '10:20:39'), rs('INTERACTING', '10:20:39', '10:30:00'), rs('OFF_QUEUE', '10:30:00', null)],
 };
 
 let hits = {};

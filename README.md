@@ -81,6 +81,7 @@ Useful options
 | `-FlagIdleStretchSeconds` | 15 | flag when an eligible agent was idle this long *continuously* during the wait |
 | `-ChunkHours` | 24 | analytics query window size (keeps every query inside API limits) |
 | `-MaxNamesPerCell` | 15 | cap for agent-name lists in a cell |
+| `-EventsOutputPath` | `<OutputPath>_PriorityEvents.csv` | where the priority event log CSV is written |
 | `-ClientId` / `-ClientSecret` | embedded values | override the credentials embedded at the top of the script |
 
 Runtime: one `GET /api/v2/conversations/{id}` per call is needed for the priority, so a busy division
@@ -91,7 +92,9 @@ All times in the CSV are in the **local time zone of the machine running the scr
 
 ## 3. Reading the CSV
 
-Start by filtering `ReviewFlag = REVIEW` and reading `ReviewReason` and `JumpedAheadDetail`.
+Start by filtering `ReviewFlag = REVIEW` and reading `ReviewReason`, `PriorityEvidence` and
+`JumpedAheadDetail`. For the "did priority work" question, open the second CSV (`…_PriorityEvents.csv`,
+section below) and filter on `Verdict`.
 
 ### Identity / priority
 | Column | Meaning |
@@ -138,9 +141,38 @@ Status comes from the analytics routing-status history, so it is exactly what Ge
 | `OtherCallsBeingHandledInQueueAtEntry` | calls from this queue being handled by an agent at that moment |
 | `DivisionCallsWaitingAtEntry` | calls waiting in *any* queue of the division at that moment |
 | `CallsAnsweredInQueueDuringWait` | calls from the same queue answered while this call waited |
-| `CallsJumpedAhead` | of those, the ones that **should have been behind this call**: lower priority, or same priority but entered the queue later |
+| `AnsweredBeforeThisCallConversationIds` | the conversation ids of those calls, `;` separated (paste one into the Genesys interaction search to open it) |
+
+### Priority evidence (did priority work?)
+Every comparison is between calls **in the same queue**, using the priority Genesys recorded on each call.
+
+| Column | Meaning |
+|---|---|
+| `PriorityEvidence` | one-line verdict for this row: `HONOURED: …` and/or `VIOLATED: …`, blank when nothing relevant happened while it waited |
+| `OvertookLowerPriorityCalls`, `OvertookLowerPriorityConversationIds`, `OvertookLowerPriorityDetail` | **proof priority worked, seen from the high-priority call**: lower-priority calls that entered the queue *before* this one and were still waiting when this one was answered. Example: this row is a 400 answered at 10:20:20; the detail lists the 100 that entered at 10:20:00 and was only answered at 10:20:40. |
+| `HigherPriorityCallsServedFirst`, `HigherPriorityServedFirstConversationIds`, `HigherPriorityServedFirstDetail` | **the same proof seen from the low-priority call**: higher-priority calls that entered *after* this one and were answered while it was still waiting. Correct behaviour, not a fault. |
+| `CallsJumpedAhead`, `JumpedAheadConversationIds` | calls answered during this call's wait that **should have been behind it**: lower priority, or same priority but entered the queue later |
 | `CallsJumpedAheadByEligibleAgent` | jumped-ahead calls answered by an agent who held this call's skills/language – i.e. that agent could have taken *this* call instead. **This is the number that proves or disproves the manager's claim.** |
 | `JumpedAheadDetail` | `conversationId (prio, entered, answered by, agentEligibleForThisCall=True/False)` for each jumped-ahead call |
+
+### The priority event log (`…_PriorityEvents.csv`)
+A second CSV is written next to the main one (or at `-EventsOutputPath`). It has **one row per pair**
+"call that was answered" / "call that was still waiting in the same queue at that moment" whenever the
+pair says something about priority. Sorted by time, it is the audit trail to hand to the manager:
+
+| `Verdict` | Meaning |
+|---|---|
+| `PRIORITY HONOURED` | the answered call had **higher** priority than a call that had entered the queue **earlier** and was still waiting. E.g. `AnsweredConversationId` = a 400 entered 10:20:10, answered 10:20:20; `WaitingConversationId` = a 100 entered 10:20:00, answered 10:20:40. |
+| `PRIORITY VIOLATED` | the answered call had **lower** priority than a call that was still waiting. Check `AnsweringAgentEligibleForWaiting`: `False` means the agent lacked the waiting call's skills/language (not a priority fault); `True` with `AnsweredRoutingMethod = Standard` is a genuine violation. |
+| `FIFO VIOLATED (same priority)` | equal priority, but a younger call was answered before an older one (again check eligibility). |
+
+Other columns: `AnsweredPriority` / `WaitingPriority`, both calls' queue entry times, `AnsweredAtLocal`,
+`AnsweredBy`, how long each had waited at that instant, what eventually happened to the waiting call
+(`WaitingOutcome`, `WaitingAnsweredAtLocal`, `WaitingAnsweredBy`), `WaitingRequestedSkills`, and a `Note`
+explaining the most likely non-priority cause when one is visible.
+
+The console summary prints the totals of each verdict, so a healthy queue reads e.g.
+`PRIORITY HONOURED: 57, PRIORITY VIOLATED: 0`.
 
 ### `ReviewFlag` / `ReviewReason`
 A row is flagged when any of these is true:

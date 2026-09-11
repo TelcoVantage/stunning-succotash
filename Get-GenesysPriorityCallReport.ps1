@@ -63,6 +63,11 @@
 .PARAMETER OutputPath
     CSV output path. Default: .\GenesysPriorityCallReport_<timestamp>.csv
 
+.PARAMETER EventsOutputPath
+    Second CSV: the priority event log (one row per answered-call / still-waiting-call pair in the same
+    queue with a verdict PRIORITY HONOURED / PRIORITY VIOLATED / FIFO VIOLATED).
+    Default: <OutputPath>_PriorityEvents.csv
+
 .PARAMETER ChunkHours
     Size of the analytics query windows (default 24h). Keeps every query well inside API limits.
 
@@ -99,6 +104,7 @@ param(
     [datetime]$EndDate,
     [string[]]$QueueNames,
     [string]$OutputPath,
+    [string]$EventsOutputPath,
     [int]$ChunkHours = 24,
     [int]$FlagIdleStretchSeconds = 15,
     [int]$MaxNamesPerCell = 15,
@@ -920,6 +926,7 @@ foreach ($a in $sorted) {
 }
 
 $rows = @()
+$events = @()
 $rowCounter = 0
 for ($idx = 0; $idx -lt $sorted.Count; $idx++) {
     $a = $sorted[$idx]
@@ -938,57 +945,127 @@ for ($idx = 0; $idx -lt $sorted.Count; $idx++) {
     $handledSameQueue = 0
     $waitingDivision = 0
     $answeredDuringWait = 0
-    $jumped = @()
+    $answeredBeforeIds = @()          # every same-queue call answered while this one waited
+    $jumped = @()                     # ... of which: should have been behind this call (violation)
+    $jumpedIds = @()
     $jumpedEligible = 0
+    $overtakenByHigher = @()          # ... of which: higher priority, entered later (priority honoured)
+    $overtakenByHigherIds = @()
+    $overtook = @()                   # calls this call was answered ahead of although they were older + lower priority (priority honoured)
+    $overtookIds = @()
+    $Tans = $null
+    if ($a.AnswerTime -ne $null) { $Tans = $a.AnswerTime }
 
+    # candidate window: every same-queue call whose queue time can overlap ours
     $j = $idx - 1
+    $cands = @()
     while ($j -ge 0) {
         $o = $sorted[$j]
         if ($o.QueueStart -lt $lookback) { break }
+        $cands += $o
         $j--
-        if ($o.ConversationId -eq $a.ConversationId -and $o.AttemptNo -eq $a.AttemptNo) { continue }
-        $same = ($o.QueueId -eq $a.QueueId)
-        # waiting at entry: entered before T and left after T
-        if ($o.QueueStart -le $T -and $o.QueueEnd -gt $T) {
-            $waitingDivision++
-            if ($same) {
-                $waitingSameQueue++
-                if ($o.Priority -ne $null -and $a.Priority -ne $null -and $o.Priority -ge $a.Priority) { $waitingAheadHigherOrEqual++ }
-            }
-        }
-        if ($same -and $o.AnswerTime -ne $null -and $o.HandleEnd -ne $null -and $o.AnswerTime -le $T -and $o.HandleEnd -gt $T) { $handledSameQueue++ }
-        if ($same -and $o.AnswerTime -ne $null -and $o.AnswerTime -gt $T -and $o.AnswerTime -lt $Tend) {
-            $answeredDuringWait++
-            # entered earlier than us: only a "jump" if it had LOWER priority
-            if ($o.Priority -ne $null -and $a.Priority -ne $null -and $o.Priority -lt $a.Priority) {
-                $elig = Test-AgentEligible -User $Users[$o.AnsweredBy] -SkillIds $a.SkillIds -LanguageId $a.LanguageId
-                if ($elig) { $jumpedEligible++ }
-                $jumped += ('{0} (prio {1}, entered {2}, answered {3} by {4}, agentEligibleForThisCall={5})' -f $o.ConversationId, $o.Priority, (Format-LocalTime $o.QueueStart), (Format-LocalTime $o.AnswerTime), (Get-UserName $o.AnsweredBy), $elig)
-            }
-        }
     }
     $j = $idx + 1
     while ($j -lt $sorted.Count) {
         $o = $sorted[$j]
-        if ($o.QueueStart -ge $Tend) { break }
+        if ($o.QueueStart -ge $a.QueueEnd) { break }
+        $cands += $o
         $j++
+    }
+
+    foreach ($o in $cands) {
         if ($o.ConversationId -eq $a.ConversationId -and $o.AttemptNo -eq $a.AttemptNo) { continue }
         $same = ($o.QueueId -eq $a.QueueId)
+        $bothPrio = ($o.Priority -ne $null -and $a.Priority -ne $null)
+
+        # waiting when this call entered
         if ($o.QueueStart -le $T -and $o.QueueEnd -gt $T) {
-            # identical entry timestamp
             $waitingDivision++
-            if ($same) { $waitingSameQueue++; if ($o.Priority -ne $null -and $a.Priority -ne $null -and $o.Priority -ge $a.Priority) { $waitingAheadHigherOrEqual++ } }
+            if ($same) {
+                $waitingSameQueue++
+                if ($bothPrio -and $o.Priority -ge $a.Priority) { $waitingAheadHigherOrEqual++ }
+            }
         }
-        if ($same -and $o.AnswerTime -ne $null -and $o.AnswerTime -gt $T -and $o.AnswerTime -lt $Tend) {
+        if (-not $same) { continue }
+
+        # being handled when this call entered
+        if ($o.AnswerTime -ne $null -and $o.HandleEnd -ne $null -and $o.AnswerTime -le $T -and $o.HandleEnd -gt $T) { $handledSameQueue++ }
+
+        # answered while this call was waiting
+        if ($o.AnswerTime -ne $null -and $o.AnswerTime -gt $T -and $o.AnswerTime -lt $Tend) {
             $answeredDuringWait++
-            # entered AFTER us: a jump if lower OR equal priority (FIFO within the same priority)
-            if ($o.Priority -ne $null -and $a.Priority -ne $null -and $o.Priority -le $a.Priority) {
-                $elig = Test-AgentEligible -User $Users[$o.AnsweredBy] -SkillIds $a.SkillIds -LanguageId $a.LanguageId
-                if ($elig) { $jumpedEligible++ }
-                $jumped += ('{0} (prio {1}, entered {2}, answered {3} by {4}, agentEligibleForThisCall={5})' -f $o.ConversationId, $o.Priority, (Format-LocalTime $o.QueueStart), (Format-LocalTime $o.AnswerTime), (Get-UserName $o.AnsweredBy), $elig)
+            $answeredBeforeIds += $o.ConversationId
+            if ($bothPrio) {
+                $enteredLater = ($o.QueueStart -gt $T)
+                $detail = ('{0} (prio {1}, entered {2}, answered {3} by {4})' -f $o.ConversationId, $o.Priority, (Format-LocalTime $o.QueueStart), (Format-LocalTime $o.AnswerTime), (Get-UserName $o.AnsweredBy))
+                if ($o.Priority -gt $a.Priority -and $enteredLater) {
+                    # correct behaviour: a higher-priority call arrived later and was served first
+                    $overtakenByHigher += $detail
+                    $overtakenByHigherIds += $o.ConversationId
+                }
+                elseif ($o.Priority -lt $a.Priority -or ($o.Priority -eq $a.Priority -and $enteredLater)) {
+                    # wrong order: lower priority, or same priority but younger, served first
+                    $elig = Test-AgentEligible -User $Users[$o.AnsweredBy] -SkillIds $a.SkillIds -LanguageId $a.LanguageId
+                    if ($elig) { $jumpedEligible++ }
+                    $jumped += ($detail.TrimEnd(')') + (', agentEligibleForThisCall={0})' -f $elig))
+                    $jumpedIds += $o.ConversationId
+                }
+            }
+        }
+
+        # still waiting when THIS call was answered, although older and lower priority => this call overtook it (priority honoured)
+        if ($Tans -ne $null -and $bothPrio -and $o.QueueStart -lt $T -and $o.QueueEnd -gt $Tans -and $o.Priority -lt $a.Priority) {
+            $laterText = 'still waiting at ' + (Format-LocalTime $Tans)
+            if ($o.AnswerTime -ne $null) { $laterText = 'answered later at ' + (Format-LocalTime $o.AnswerTime) + ' by ' + (Get-UserName $o.AnsweredBy) }
+            elseif ($o.Outcome -ne 'Answered') { $laterText = $o.Outcome + ' at ' + (Format-LocalTime $o.QueueEnd) }
+            $overtook += ('{0} (prio {1}, entered {2}, {3})' -f $o.ConversationId, $o.Priority, (Format-LocalTime $o.QueueStart), $laterText)
+            $overtookIds += $o.ConversationId
+        }
+
+        # ---- event log (recorded once, from the perspective of the call that got answered) ----
+        if ($Tans -ne $null -and $bothPrio -and $o.QueueStart -lt $Tans -and $o.QueueEnd -gt $Tans) {
+            $verdict = ''
+            $olderThanUs = ($o.QueueStart -lt $T)
+            if ($o.Priority -lt $a.Priority -and $olderThanUs) { $verdict = 'PRIORITY HONOURED' }
+            elseif ($o.Priority -gt $a.Priority) { $verdict = 'PRIORITY VIOLATED' }
+            elseif ($o.Priority -eq $a.Priority -and $olderThanUs) { $verdict = 'FIFO VIOLATED (same priority)' }
+            if ($verdict -ne '') {
+                $agentElig = Test-AgentEligible -User $Users[$a.AnsweredBy] -SkillIds $o.SkillIds -LanguageId $o.LanguageId
+                $note = ''
+                if ($verdict -ne 'PRIORITY HONOURED' -and -not $agentElig) { $note = 'answering agent lacked the waiting call''s skills/language - not a priority fault' }
+                elseif ($verdict -ne 'PRIORITY HONOURED' -and $a.UsedRouting -ne '' -and $a.UsedRouting -ne 'Standard') { $note = 'routing method was ' + $a.UsedRouting + ' - check bullseye/preferred agent rules' }
+                $waitSkills = @()
+                foreach ($sid in $o.SkillIds) { $waitSkills += (Get-SkillName $sid) }
+                $events += (New-Object PSObject -Property @{
+                    Verdict                          = $verdict
+                    QueueName                        = $QueueNameMap[$a.QueueId]
+                    AnsweredConversationId           = $a.ConversationId
+                    AnsweredPriority                 = $a.Priority
+                    AnsweredEnteredQueueLocal        = (Format-LocalTime $T)
+                    AnsweredAtLocal                  = (Format-LocalTime $Tans)
+                    AnsweredBy                       = (Get-UserName $a.AnsweredBy)
+                    AnsweredWaitSeconds              = (Get-SecondsBetween $T $Tans)
+                    WaitingConversationId            = $o.ConversationId
+                    WaitingPriority                  = $o.Priority
+                    WaitingEnteredQueueLocal         = (Format-LocalTime $o.QueueStart)
+                    WaitingHadWaitedSeconds          = (Get-SecondsBetween $o.QueueStart $Tans)
+                    WaitingOutcome                   = $o.Outcome
+                    WaitingAnsweredAtLocal           = (Format-LocalTime $o.AnswerTime)
+                    WaitingAnsweredBy                = (Get-UserName $o.AnsweredBy)
+                    WaitingRequestedSkills           = ($waitSkills -join '; ')
+                    AnsweringAgentEligibleForWaiting = $agentElig
+                    AnsweredRoutingMethod            = $a.UsedRouting
+                    Note                             = $note
+                    SortKey                          = $Tans
+                })
             }
         }
     }
+
+    $priorityEvidence = ''
+    if ($overtook.Count -gt 0) { $priorityEvidence = ('HONOURED: answered ahead of {0} older lower-priority call(s)' -f $overtook.Count) }
+    if ($overtakenByHigher.Count -gt 0) { if ($priorityEvidence -ne '') { $priorityEvidence += ' | ' }; $priorityEvidence += ('HONOURED: {0} higher-priority call(s) that arrived later were served first' -f $overtakenByHigher.Count) }
+    if ($jumped.Count -gt 0) { if ($priorityEvidence -ne '') { $priorityEvidence += ' | ' }; $priorityEvidence += ('VIOLATED: {0} call(s) that should have been behind this one were answered first' -f $jumped.Count) }
 
     # ---- agents at queue entry / during wait -----------------------------------------------------
     $members = @()
@@ -1090,8 +1167,17 @@ for ($idx = 0; $idx -lt $sorted.Count; $idx++) {
         OtherCallsBeingHandledInQueueAtEntry    = $handledSameQueue
         DivisionCallsWaitingAtEntry             = $waitingDivision
         CallsAnsweredInQueueDuringWait          = $answeredDuringWait
+        AnsweredBeforeThisCallConversationIds   = ($answeredBeforeIds -join '; ')
+        PriorityEvidence                        = $priorityEvidence
+        OvertookLowerPriorityCalls              = $overtook.Count
+        OvertookLowerPriorityConversationIds    = ($overtookIds -join '; ')
+        OvertookLowerPriorityDetail             = ($overtook -join ' || ')
+        HigherPriorityCallsServedFirst          = $overtakenByHigher.Count
+        HigherPriorityServedFirstConversationIds = ($overtakenByHigherIds -join '; ')
+        HigherPriorityServedFirstDetail         = ($overtakenByHigher -join ' || ')
         CallsJumpedAhead                        = $jumped.Count
         CallsJumpedAheadByEligibleAgent         = $jumpedEligible
+        JumpedAheadConversationIds              = ($jumpedIds -join '; ')
         JumpedAheadDetail                       = ($jumped -join ' || ')
         DisconnectType                          = $a.DisconnectType
     })
@@ -1117,12 +1203,39 @@ $columns = @(
     'AgentsIdleAtExit', 'AgentsIdleAndEligibleAtExit',
     'SecondsAnEligibleAgentWasIdleDuringWait', 'LongestEligibleIdleStretchSeconds',
     'OtherCallsWaitingInQueueAtEntry', 'OtherCallsAheadWithHigherOrEqualPriority', 'OtherCallsBeingHandledInQueueAtEntry',
-    'DivisionCallsWaitingAtEntry', 'CallsAnsweredInQueueDuringWait',
-    'CallsJumpedAhead', 'CallsJumpedAheadByEligibleAgent', 'JumpedAheadDetail',
+    'DivisionCallsWaitingAtEntry', 'CallsAnsweredInQueueDuringWait', 'AnsweredBeforeThisCallConversationIds',
+    'PriorityEvidence',
+    'OvertookLowerPriorityCalls', 'OvertookLowerPriorityConversationIds', 'OvertookLowerPriorityDetail',
+    'HigherPriorityCallsServedFirst', 'HigherPriorityServedFirstConversationIds', 'HigherPriorityServedFirstDetail',
+    'CallsJumpedAhead', 'CallsJumpedAheadByEligibleAgent', 'JumpedAheadConversationIds', 'JumpedAheadDetail',
     'DisconnectType', 'QueueId'
 )
 
 $rows | Sort-Object -Property QueueEntryTimeLocal | Select-Object $columns | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+# ---- priority event log: one row per (answered call, call still waiting) pair with a verdict ----
+if (-not $EventsOutputPath) {
+    if ($OutputPath -like '*.csv') { $EventsOutputPath = $OutputPath.Substring(0, $OutputPath.Length - 4) + '_PriorityEvents.csv' }
+    else { $EventsOutputPath = $OutputPath + '_PriorityEvents.csv' }
+}
+$eventColumns = @(
+    'Verdict', 'QueueName',
+    'AnsweredConversationId', 'AnsweredPriority', 'AnsweredEnteredQueueLocal', 'AnsweredAtLocal', 'AnsweredWaitSeconds', 'AnsweredBy', 'AnsweredRoutingMethod',
+    'WaitingConversationId', 'WaitingPriority', 'WaitingEnteredQueueLocal', 'WaitingHadWaitedSeconds', 'WaitingRequestedSkills',
+    'WaitingOutcome', 'WaitingAnsweredAtLocal', 'WaitingAnsweredBy',
+    'AnsweringAgentEligibleForWaiting', 'Note'
+)
+if ($events.Count -gt 0) {
+    $events | Sort-Object -Property SortKey | Select-Object $eventColumns | Export-Csv -Path $EventsOutputPath -NoTypeInformation -Encoding UTF8
+}
+else {
+    # no events: still write the header row so the file always exists
+    Set-Content -Path $EventsOutputPath -Value ('"' + ($eventColumns -join '","') + '"') -Encoding UTF8
+}
+$honoured = @($events | Where-Object { $_.Verdict -eq 'PRIORITY HONOURED' })
+$violated = @($events | Where-Object { $_.Verdict -eq 'PRIORITY VIOLATED' })
+$violatedElig = @($violated | Where-Object { $_.AnsweringAgentEligibleForWaiting -eq $true })
+$fifo = @($events | Where-Object { $_.Verdict -like 'FIFO*' })
 
 $flagged = @($rows | Where-Object { $_.ReviewFlag -eq 'REVIEW' })
 $answered = @($rows | Where-Object { $_.Outcome -eq 'Answered' })
@@ -1133,15 +1246,21 @@ Write-Host ('Division            : {0}' -f $division.name)
 Write-Host ('Window (local)      : {0} -> {1}' -f $StartDate.ToString('yyyy-MM-dd HH:mm'), $EndDate.ToString('yyyy-MM-dd HH:mm'))
 Write-Host ('Queue attempts      : {0}  (answered {1}, abandoned {2})' -f $rows.Count, $answered.Count, $abandoned.Count)
 Write-Host ('Flagged for review  : {0}' -f $flagged.Count)
-$byPrio = @($rows | Group-Object -Property Priority | Sort-Object -Property Name)
+$byPrio = @($rows | Group-Object -Property Priority | Sort-Object -Property @{ Expression = { if ([string]$_.Name -eq '') { -1 } else { [int]$_.Name } } })
 foreach ($g in $byPrio) {
     $grpFlag = @($g.Group | Where-Object { $_.ReviewFlag -eq 'REVIEW' }).Count
     $avgWait = 0
     if ($g.Count -gt 0) { $avgWait = [int](($g.Group | Measure-Object -Property WaitSeconds -Average).Average) }
     Write-Host ('  priority {0,-4}: {1,5} call(s), avg wait {2,5}s, {3} flagged' -f $g.Name, $g.Count, $avgWait, $grpFlag)
 }
+Write-Host ''
+Write-Host 'Priority evidence (same queue, pairs of "answered call" vs "call still waiting"):'
+Write-Host ('  PRIORITY HONOURED : {0}  (higher-priority call answered ahead of an older lower-priority call)' -f $honoured.Count)
+Write-Host ('  PRIORITY VIOLATED : {0}  (lower-priority call answered while a higher-priority call waited; {1} by an agent eligible for the waiting call)' -f $violated.Count, $violatedElig.Count)
+Write-Host ('  FIFO VIOLATED     : {0}  (same priority, younger call answered first)' -f $fifo.Count)
 Write-Host ('API calls made      : {0}' -f $script:ApiCallCount)
 Write-Host ('CSV written         : {0}' -f $OutputPath)
+Write-Host ('Events CSV written  : {0}' -f $EventsOutputPath)
 Write-Host '========================================='
 Write-Host 'Tip: filter ReviewFlag = REVIEW and read ReviewReason / JumpedAheadDetail first. See README.md for how to interpret the columns.'
 

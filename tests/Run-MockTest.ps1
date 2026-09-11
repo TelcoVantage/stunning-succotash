@@ -8,5 +8,8 @@ $out = Join-Path $here 'mock-output.csv'
     -DivisionName 'Customer Service' -StartDate '2026-09-02 09:00' -EndDate '2026-09-02 12:00' `
     -OutputPath $out
 # Expected: c2 (priority 5) flagged with CallsJumpedAheadByEligibleAgent = 1 (c3 answered by Bob Agent),
-#           LongestEligibleIdleStretchSeconds = 28 ; c4 flagged as abandoned while Carol Agent was idle.
-Import-Csv $out | Select-Object ConversationId, Priority, ReviewFlag, WaitSeconds, AgentsIdleAtEntry, AgentsIdleAndEligibleAtEntry, CallsJumpedAheadByEligibleAgent, LongestEligibleIdleStretchSeconds | Format-Table -AutoSize
+#           LongestEligibleIdleStretchSeconds = 28 ; c4 flagged as abandoned while Carol Agent was idle;
+#           c7 (priority 400) shows OvertookLowerPriorityCalls = 1 (c6, priority 100) and c6 shows
+#           HigherPriorityCallsServedFirst = 1. Events CSV: 1 PRIORITY HONOURED (c7 over c6), 1 PRIORITY VIOLATED (c3 over c2).
+Import-Csv $out | Select-Object ConversationId, Priority, ReviewFlag, WaitSeconds, AgentsIdleAndEligibleAtEntry, AnsweredBeforeThisCallConversationIds, OvertookLowerPriorityCalls, HigherPriorityCallsServedFirst, CallsJumpedAheadByEligibleAgent, PriorityEvidence | Format-Table -AutoSize
+Import-Csv (Join-Path $here 'mock-output_PriorityEvents.csv') | Select-Object Verdict, AnsweredConversationId, AnsweredPriority, AnsweredAtLocal, WaitingConversationId, WaitingPriority, WaitingEnteredQueueLocal, AnsweringAgentEligibleForWaiting | Format-Table -AutoSize
