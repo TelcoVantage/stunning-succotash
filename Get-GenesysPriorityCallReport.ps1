@@ -41,8 +41,9 @@
         analytics:conversationDetail:view, analytics:userDetail:view, conversation:communication:view,
         routing:queue:view, routing:skill:view, routing:language:view, directory:user:view,
         authorization:division:view
-    If omitted, the environment variables GENESYS_CLIENT_ID / GENESYS_CLIENT_SECRET are used, and
-    failing that you are prompted.
+    Optional: by default the credentials embedded at the top of the script ($EmbeddedClientId /
+    $EmbeddedClientSecret) are used, then the environment variables GENESYS_CLIENT_ID /
+    GENESYS_CLIENT_SECRET. Passing the parameters overrides both.
 
 .PARAMETER Region
     Genesys Cloud region domain, e.g. mypurecloud.com, mypurecloud.ie, mypurecloud.com.au,
@@ -76,9 +77,9 @@
     Optional overrides of https://api.<Region> and https://login.<Region>/oauth/token (for proxies or testing).
 
 .EXAMPLE
-    .\Get-GenesysPriorityCallReport.ps1 -ClientId xxx -ClientSecret yyy -Region mypurecloud.ie `
-        -DivisionName 'Customer Service' -StartDate '2026-09-01' -EndDate '2026-09-08' `
-        -OutputPath C:\Temp\PriorityAudit.csv
+    # credentials embedded in the script
+    .\Get-GenesysPriorityCallReport.ps1 -Region mypurecloud.ie -DivisionName 'Customer Service' `
+        -StartDate '2026-09-01' -EndDate '2026-09-08' -OutputPath C:\Temp\PriorityAudit.csv
 
 .EXAMPLE
     .\Get-GenesysPriorityCallReport.ps1 -Region mypurecloud.com -DivisionId 8b1c... -QueueNames 'Sales*','VIP Line'
@@ -102,6 +103,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# =====================================================================================================
+# EMBEDDED CREDENTIALS - fill these in. They are used unless -ClientId / -ClientSecret are passed.
+# Anyone who can read this file can call the Genesys API with these credentials: keep the file
+# access-controlled and give the OAuth client a read-only role (see README, section 1).
+# =====================================================================================================
+$EmbeddedClientId     = 'PASTE-YOUR-CLIENT-ID-HERE'
+$EmbeddedClientSecret = 'PASTE-YOUR-CLIENT-SECRET-HERE'
+$EmbeddedRegion       = ''   # optional, e.g. 'mypurecloud.ie' - overrides the -Region default when set
 
 # =====================================================================================================
 # region Helpers (all CLM-safe)
@@ -370,11 +380,14 @@ function Test-AgentEligible {
 # region Parameters / auth
 # =====================================================================================================
 
+if (-not $ClientId -and $EmbeddedClientId -ne '' -and $EmbeddedClientId -notlike 'PASTE-YOUR-*') { $ClientId = $EmbeddedClientId }
+if (-not $ClientSecret -and $EmbeddedClientSecret -ne '' -and $EmbeddedClientSecret -notlike 'PASTE-YOUR-*') { $ClientSecret = $EmbeddedClientSecret }
 if (-not $ClientId) { $ClientId = $env:GENESYS_CLIENT_ID }
 if (-not $ClientSecret) { $ClientSecret = $env:GENESYS_CLIENT_SECRET }
-if (-not $ClientId) { $ClientId = Read-Host 'Genesys OAuth Client ID' }
-if (-not $ClientSecret) { $ClientSecret = Read-Host 'Genesys OAuth Client Secret' }
-if (-not $ClientId -or -not $ClientSecret) { throw 'ClientId and ClientSecret are required.' }
+if (-not $ClientId -or -not $ClientSecret) {
+    throw 'No credentials: set $EmbeddedClientId / $EmbeddedClientSecret at the top of the script, or pass -ClientId / -ClientSecret.'
+}
+if ($EmbeddedRegion -ne '' -and -not $PSBoundParameters.ContainsKey('Region')) { $Region = $EmbeddedRegion }
 if (-not $DivisionName -and -not $DivisionId) { throw 'Specify -DivisionName or -DivisionId.' }
 
 if ($EndDate -eq $null -or $EndDate -eq [datetime]'0001-01-01') { $EndDate = Get-Date }

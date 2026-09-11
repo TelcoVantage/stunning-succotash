@@ -32,6 +32,14 @@ holds these permissions **in the division you report on** (or all divisions):
 | `directory:user:view` | agent names, skills, languages |
 | `authorization:division:view` | division lookup |
 
+### Credentials
+The client id and secret are **embedded in the script**: open `Get-GenesysPriorityCallReport.ps1` and
+fill in `$EmbeddedClientId`, `$EmbeddedClientSecret` (and optionally `$EmbeddedRegion`) at the top.
+Anyone who can read the file can use those credentials, so restrict access to the file and keep the
+OAuth client's role read-only. `-ClientId` / `-ClientSecret` on the command line override the embedded
+values; the `GENESYS_CLIENT_ID` / `GENESYS_CLIENT_SECRET` environment variables are used only when
+neither is set.
+
 ### Region
 Pass the login/API domain of your org with `-Region`, e.g. `mypurecloud.com`, `mypurecloud.ie`,
 `mypurecloud.com.au`, `mypurecloud.de`, `mypurecloud.jp`, `usw2.pure.cloud`, `cac1.pure.cloud`,
@@ -43,8 +51,6 @@ Pass the login/API domain of your org with `-Region`, e.g. `mypurecloud.com`, `m
 
 ```powershell
 .\Get-GenesysPriorityCallReport.ps1 `
-    -ClientId     '<client id>' `
-    -ClientSecret '<client secret>' `
     -Region       'mypurecloud.ie' `
     -DivisionName 'Customer Service' `
     -StartDate    '2026-09-01' `
@@ -62,7 +68,7 @@ Useful options
 | `-FlagIdleStretchSeconds` | 15 | flag when an eligible agent was idle this long *continuously* during the wait |
 | `-ChunkHours` | 24 | analytics query window size (keeps every query inside API limits) |
 | `-MaxNamesPerCell` | 15 | cap for agent-name lists in a cell |
-| `GENESYS_CLIENT_ID` / `GENESYS_CLIENT_SECRET` | | env vars used when `-ClientId/-ClientSecret` are omitted |
+| `-ClientId` / `-ClientSecret` | embedded values | override the credentials embedded at the top of the script |
 
 Runtime: one `GET /api/v2/conversations/{id}` per call is needed for the priority, so a busy division
 over a month may take a while (progress bars are shown; 429 rate limits are retried automatically).
