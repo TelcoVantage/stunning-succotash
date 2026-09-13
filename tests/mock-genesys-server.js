@@ -4,6 +4,7 @@ const url = require('url');
 
 const DIV = 'div-1';
 const Q1 = 'queue-1';
+const Q2 = 'queue-2'; // AU RAS, members: A only, scoring method deliberately different
 const S1 = 'skill-1';
 const L1 = 'lang-1';
 const A = 'user-a', B = 'user-b', C = 'user-c';
@@ -17,6 +18,8 @@ const A = 'user-a', B = 'user-b', C = 'user-c';
 // c5: prio 0, no skill,  enters 10:10:00, answered by A 10:10:02 ; conversation GET returns 404 (purged)
 // c6: prio 100, no skill, enters 10:20:00, answered by C 10:20:40  (older, lower priority)
 // c7: prio 400, no skill, enters 10:20:10, answered by A 10:20:20  -> overtakes c6 = PRIORITY HONOURED
+// c8: prio 800, Q2 (AU RAS), enters 10:40:00, answered by A 10:45:00 (alert 10:44:58)
+// c9: prio 400, Q1, enters 10:40:05, alerted to A 10:40:10, answered 10:40:12 -> A took a 400 while an 800 waited in Q2 = WRONG ORDER
 const T = (hms) => `2026-09-02T${hms}.000Z`;
 
 function seg(type, start, end, extra) { return Object.assign({ segmentType: type, segmentStart: T(start), segmentEnd: T(end) }, extra || {}); }
@@ -43,26 +46,30 @@ const conversations = [
   conv('c5', '10:10:00', '10:12:00', seg('interact', '10:10:00', '10:10:02', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:10:00', '10:10:02', '10:12:00')]),
   conv('c6', '10:20:00', '10:24:00', seg('interact', '10:20:00', '10:20:40', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(C, '10:20:38', '10:20:40', '10:24:00')]),
   conv('c7', '10:20:10', '10:25:00', seg('interact', '10:20:10', '10:20:20', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:20:18', '10:20:20', '10:25:00')]),
+  conv('c8', '10:40:00', '10:50:00', seg('interact', '10:40:00', '10:45:00', { queueId: Q2, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:44:58', '10:45:00', '10:50:00')]),
+  conv('c9', '10:40:05', '10:44:00', seg('interact', '10:40:05', '10:40:12', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:40:10', '10:40:12', '10:44:00')]),
 ];
-const priorities = { c1: 0, c2: 5, c3: 0, c4: 0, c6: 100, c7: 400 }; // c5 -> 404
+const priorities = { c1: 0, c2: 5, c3: 0, c4: 0, c6: 100, c7: 400, c8: 800, c9: 400 }; // c5 -> 404
+const queueOf = { c8: Q2 };
 
 function convDetail(id) {
   if (!(id in priorities)) return null;
-  const crd = { queue: { id: Q1 }, priority: priorities[id], skills: id === 'c2' ? [{ id: S1, name: 'VIP Skill' }] : [], scoredAgents: [] };
+  const q = queueOf[id] || Q1;
+  const crd = { queue: { id: q }, priority: priorities[id], skills: id === 'c2' ? [{ id: S1, name: 'VIP Skill' }] : [], scoredAgents: [] };
   return { id, participants: [
     { id: 'p1', purpose: 'customer' },
-    { id: 'p2', purpose: 'acd', queueId: Q1, connectedTime: conversations.find(c => c.conversationId === id).conversationStart, conversationRoutingData: crd }
+    { id: 'p2', purpose: 'acd', queueId: q, connectedTime: conversations.find(c => c.conversationId === id).conversationStart, conversationRoutingData: crd }
   ] };
 }
 
 const users = {
-  [A]: { id: A, name: 'Alice Agent', skills: [{ id: S1, name: 'VIP Skill' }], languages: [] },
-  [B]: { id: B, name: 'Bob Agent', skills: [{ id: S1, name: 'VIP Skill' }], languages: [] },
-  [C]: { id: C, name: 'Carol Agent', skills: [], languages: [] },
+  [A]: { id: A, name: 'Alice Agent', state: 'active', skills: [{ id: S1, name: 'VIP Skill', proficiency: 5 }], languages: [] },
+  [B]: { id: B, name: 'Bob Agent', state: 'active', skills: [{ id: S1, name: 'VIP Skill', proficiency: 3 }], languages: [] },
+  [C]: { id: C, name: 'Carol Agent', state: 'active', skills: [], languages: [] },
 };
 function rs(status, start, end) { return { routingStatus: status, startTime: T(start), endTime: end ? T(end) : undefined }; }
 const routing = {
-  [A]: [rs('IDLE', '09:00:00', '10:00:02'), rs('INTERACTING', '10:00:02', '10:05:00'), rs('IDLE', '10:05:00', '10:10:00'), rs('INTERACTING', '10:10:00', '10:20:18'), rs('IDLE', '10:20:18', '10:20:19'), rs('INTERACTING', '10:20:19', '10:25:00'), rs('OFF_QUEUE', '10:25:00', null)],
+  [A]: [rs('IDLE', '09:00:00', '10:00:02'), rs('INTERACTING', '10:00:02', '10:05:00'), rs('IDLE', '10:05:00', '10:10:00'), rs('INTERACTING', '10:10:00', '10:20:18'), rs('IDLE', '10:20:18', '10:20:19'), rs('INTERACTING', '10:20:19', '10:25:00'), rs('IDLE', '10:25:00', '10:30:00'), rs('OFF_QUEUE', '10:30:00', '10:39:00'), rs('INTERACTING', '10:39:00', '10:44:00'), rs('IDLE', '10:44:00', '10:44:58'), rs('INTERACTING', '10:44:58', '10:50:00'), rs('OFF_QUEUE', '10:50:00', null)],
   [B]: [rs('IDLE', '10:00:00', '10:00:58'), rs('INTERACTING', '10:00:58', '10:01:50'), rs('IDLE', '10:01:50', '10:01:57'), rs('INTERACTING', '10:01:57', '10:06:00'), rs('OFF_QUEUE', '10:06:00', null)],
   [C]: [rs('IDLE', '09:30:00', '10:15:00'), rs('INTERACTING', '10:15:00', '10:20:37'), rs('IDLE', '10:20:37', '10:20:39'), rs('INTERACTING', '10:20:39', '10:30:00'), rs('OFF_QUEUE', '10:30:00', null)],
 };
@@ -93,8 +100,10 @@ const server = http.createServer((req, res) => {
       if (!divOk) return send(400, { message: 'missing division filter' });
       return send(200, { conversations, totalHits: conversations.length });
     }
-    if (p === '/api/v2/routing/queues/' + Q1) return send(200, { id: Q1, name: 'Customer Service Line' });
+    if (p === '/api/v2/routing/queues/' + Q1) return send(200, { id: Q1, name: 'Customer Service Line', scoringMethod: 'TimestampAndPriority', skillEvaluationMethod: 'BEST', mediaSettings: { call: { serviceLevel: { percentage: 0.8, durationMs: 20000 } } }, acwSettings: { wrapupPrompt: 'MANDATORY_TIMEOUT', timeoutMs: 30000 } });
+    if (p === '/api/v2/routing/queues/' + Q2) return send(200, { id: Q2, name: 'AU RAS', scoringMethod: 'ConversationScore', skillEvaluationMethod: 'BEST', routingRules: [{ operator: 'MEETS_THRESHOLD', threshold: 1, waitSeconds: 30 }] });
     if (p === '/api/v2/routing/queues/' + Q1 + '/members') return send(200, { entities: [A, B, C].map(id => ({ id, joined: true, user: users[id] })), pageCount: 1 });
+    if (p === '/api/v2/routing/queues/' + Q2 + '/members') return send(200, { entities: [A].map(id => ({ id, joined: true, user: users[id] })), pageCount: 1 });
     if (p.startsWith('/api/v2/conversations/')) {
       const d = convDetail(p.split('/').pop());
       if (!d) return send(404, { message: 'not found' });

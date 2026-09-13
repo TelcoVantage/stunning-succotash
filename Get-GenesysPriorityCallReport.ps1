@@ -700,9 +700,10 @@ if ($attempts.Count -eq 0) {
 
 # ---- Queue names + optional queue filter -----------------------------------------------------------
 $QueueNameMap = @{}
+$QueueConfig = @{}      # queueId -> raw queue object (scoringMethod, skillEvaluationMethod, routingRules, ...)
 foreach ($qid in @($queueIds.Keys)) {
     $q = Invoke-GcApi -Method Get -Path ('/api/v2/routing/queues/' + $qid) -AllowNotFound
-    if ($q -ne $null -and $q.name -ne $null) { $QueueNameMap[$qid] = [string]$q.name } else { $QueueNameMap[$qid] = $qid + ' (deleted?)' }
+    if ($q -ne $null -and $q.name -ne $null) { $QueueNameMap[$qid] = [string]$q.name; $QueueConfig[$qid] = $q } else { $QueueNameMap[$qid] = $qid + ' (deleted?)' }
 }
 if ($QueueNames -and $QueueNames.Count -gt 0) {
     $keep = @{}
@@ -831,15 +832,19 @@ while ($pos -lt $idList.Count) {
         foreach ($u in @($resp.entities)) {
             $sk = @()
             $lg = @()
-            if ($u.skills -ne $null) { foreach ($s in @($u.skills)) { if ($s.id -ne $null) { $sk += [string]$s.id; if ($s.name -ne $null -and -not $SkillNames.ContainsKey([string]$s.id)) { $SkillNames[[string]$s.id] = [string]$s.name } } } }
-            if ($u.languages -ne $null) { foreach ($l in @($u.languages)) { if ($l.id -ne $null) { $lg += [string]$l.id; if ($l.name -ne $null -and -not $LanguageNames.ContainsKey([string]$l.id)) { $LanguageNames[[string]$l.id] = [string]$l.name } } } }
-            $Users[[string]$u.id] = (New-Object PSObject -Property @{ Id = [string]$u.id; Name = [string]$u.name; SkillIds = $sk; LanguageIds = $lg })
+            $skText = @()
+            $lgText = @()
+            if ($u.skills -ne $null) { foreach ($s in @($u.skills)) { if ($s.id -ne $null) { $sk += [string]$s.id; if ($s.name -ne $null -and -not $SkillNames.ContainsKey([string]$s.id)) { $SkillNames[[string]$s.id] = [string]$s.name }; $skText += ((Get-SkillName ([string]$s.id)) + '(' + [string]$s.proficiency + ')') } } }
+            if ($u.languages -ne $null) { foreach ($l in @($u.languages)) { if ($l.id -ne $null) { $lg += [string]$l.id; if ($l.name -ne $null -and -not $LanguageNames.ContainsKey([string]$l.id)) { $LanguageNames[[string]$l.id] = [string]$l.name }; $lgText += ((Get-LanguageName ([string]$l.id)) + '(' + [string]$l.proficiency + ')') } } }
+            $uState = ''
+            if ($u.state -ne $null) { $uState = [string]$u.state }
+            $Users[[string]$u.id] = (New-Object PSObject -Property @{ Id = [string]$u.id; Name = [string]$u.name; State = $uState; SkillIds = $sk; LanguageIds = $lg; SkillText = ($skText -join '; '); LanguageText = ($lgText -join '; ') })
         }
     }
     $pos = $endPos + 1
 }
 foreach ($id in $idList) {
-    if (-not $Users.ContainsKey($id)) { $Users[$id] = (New-Object PSObject -Property @{ Id = $id; Name = $id; SkillIds = @(); LanguageIds = @() }) }
+    if (-not $Users.ContainsKey($id)) { $Users[$id] = (New-Object PSObject -Property @{ Id = $id; Name = $id; State = 'not returned'; SkillIds = @(); LanguageIds = @(); SkillText = ''; LanguageText = '' }) }
 }
 function Get-UserName { param([string]$Id) if ($Id -eq '') { return '' } if ($Users.ContainsKey($Id)) { return $Users[$Id].Name } return $Id }
 
@@ -1100,6 +1105,21 @@ for ($idx = 0; $idx -lt $sorted.Count; $idx++) {
         if ($elig -and $Tend -gt $T) { $idleWindows += @(Get-IdleIntervalsInWindow -Intervals $ivs -From $T -To $Tend) }
     }
     $coverage = Get-UnionCoverage -Intervals $idleWindows
+    # first moment (from queue entry) an eligible member was Idle => the earliest this call could have been offered
+    $firstEligibleFree = $null
+    foreach ($w in $idleWindows) { if ($firstEligibleFree -eq $null -or $w.Start -lt $firstEligibleFree) { $firstEligibleFree = $w.Start } }
+    $waitUntilFree = ''
+    $waitAfterFree = ''
+    if ($haveMemberData) {
+        if ($firstEligibleFree -ne $null) {
+            $waitUntilFree = Get-SecondsBetween $T $firstEligibleFree
+            $waitAfterFree = Get-SecondsBetween $firstEligibleFree $Tend
+        }
+        else {
+            $waitUntilFree = 'none during wait'
+            $waitAfterFree = ''
+        }
+    }
 
     # ---- review flag -----------------------------------------------------------------------------
     $reasons = @()
@@ -1162,6 +1182,9 @@ for ($idx = 0; $idx -lt $sorted.Count; $idx++) {
         AgentsIdleAndEligibleAtExit             = $(if ($haveMemberData) { $idleEligibleAtExit } else { $na })
         SecondsAnEligibleAgentWasIdleDuringWait = $(if ($haveMemberData) { $coverage.TotalSeconds } else { $na })
         LongestEligibleIdleStretchSeconds       = $(if ($haveMemberData) { $coverage.LongestSeconds } else { $na })
+        FirstEligibleAgentFreeLocal             = (Format-LocalTime $firstEligibleFree)
+        WaitUntilEligibleAgentFreeSeconds       = $waitUntilFree
+        WaitAfterEligibleAgentFreeSeconds       = $waitAfterFree
         OtherCallsWaitingInQueueAtEntry         = $waitingSameQueue
         OtherCallsAheadWithHigherOrEqualPriority = $waitingAheadHigherOrEqual
         OtherCallsBeingHandledInQueueAtEntry    = $handledSameQueue
@@ -1202,6 +1225,7 @@ $columns = @(
     'AgentsInteractingAtEntry', 'AgentsCommunicatingAtEntry', 'AgentsNotRespondingAtEntry', 'AgentsStatusUnknownAtEntry',
     'AgentsIdleAtExit', 'AgentsIdleAndEligibleAtExit',
     'SecondsAnEligibleAgentWasIdleDuringWait', 'LongestEligibleIdleStretchSeconds',
+    'FirstEligibleAgentFreeLocal', 'WaitUntilEligibleAgentFreeSeconds', 'WaitAfterEligibleAgentFreeSeconds',
     'OtherCallsWaitingInQueueAtEntry', 'OtherCallsAheadWithHigherOrEqualPriority', 'OtherCallsBeingHandledInQueueAtEntry',
     'DivisionCallsWaitingAtEntry', 'CallsAnsweredInQueueDuringWait', 'AnsweredBeforeThisCallConversationIds',
     'PriorityEvidence',
@@ -1232,6 +1256,276 @@ else {
     # no events: still write the header row so the file always exists
     Set-Content -Path $EventsOutputPath -Value ('"' + ($eventColumns -join '","') + '"') -Encoding UTF8
 }
+
+# =====================================================================================================
+# region 6. Troubleshooting reports: queue config audit, agent/queue matrix, priority by queue, agent decisions
+# =====================================================================================================
+
+function Get-CompanionPath { param([string]$Suffix) if ($OutputPath -like '*.csv') { return ($OutputPath.Substring(0, $OutputPath.Length - 4) + $Suffix + '.csv') } return ($OutputPath + $Suffix + '.csv') }
+$QueueConfigPath = Get-CompanionPath '_QueueConfig'
+$AgentQueuesPath = Get-CompanionPath '_AgentQueues'
+$PriorityByQueuePath = Get-CompanionPath '_PriorityByQueue'
+$DecisionsPath = Get-CompanionPath '_AgentDecisions'
+
+# ---- membership index: userId -> queueIds -----------------------------------------------------------
+$QueuesByUser = @{}
+foreach ($qid in @($QueueMembers.Keys)) {
+    foreach ($uid in @($QueueMembers[$qid])) {
+        if (-not $QueuesByUser.ContainsKey($uid)) { $QueuesByUser[$uid] = @() }
+        $QueuesByUser[$uid] += $qid
+    }
+}
+
+# ---- 6a. queue configuration audit -------------------------------------------------------------------
+$scoringByQueue = @{}
+$configRows = @()
+foreach ($qid in @($queueIds.Keys)) {
+    $q = $null
+    if ($QueueConfig.ContainsKey($qid)) { $q = $QueueConfig[$qid] }
+    $scoring = ''
+    $skillEval = ''
+    $routingRules = ''
+    $agentOwned = ''
+    $acw = ''
+    $sla = ''
+    if ($q -ne $null) {
+        if ($q.scoringMethod -ne $null) { $scoring = [string]$q.scoringMethod }
+        if ($q.skillEvaluationMethod -ne $null) { $skillEval = [string]$q.skillEvaluationMethod }
+        if ($q.routingRules -ne $null) {
+            $rr = @()
+            foreach ($r in @($q.routingRules)) { $rr += ('{0} after {1}s (threshold {2})' -f [string]$r.operator, [string]$r.waitSeconds, [string]$r.threshold) }
+            $routingRules = ($rr -join '; ')
+        }
+        if ($q.agentOwnedRouting -ne $null -and $q.agentOwnedRouting.enableAgentOwnedCallbacks -ne $null) { $agentOwned = [string]$q.agentOwnedRouting.enableAgentOwnedCallbacks }
+        if ($q.acwSettings -ne $null) { $acw = [string]$q.acwSettings.wrapupPrompt; if ($q.acwSettings.timeoutMs -ne $null) { $acw += ' ' + [string]$q.acwSettings.timeoutMs + 'ms' } }
+        if ($q.mediaSettings -ne $null -and $q.mediaSettings.call -ne $null -and $q.mediaSettings.call.serviceLevel -ne $null) {
+            $pct = [double]$q.mediaSettings.call.serviceLevel.percentage
+            if ($pct -le 1) { $pct = $pct * 100 }
+            $sla = ('{0}% in {1}s' -f [int]$pct, ([int]$q.mediaSettings.call.serviceLevel.durationMs / 1000))
+        }
+    }
+    if ($scoring -eq '') { $scoring = 'unknown (queue not readable)' }
+    $scoringByQueue[$qid] = $scoring
+    $routingMethod = 'Standard'
+    if ($routingRules -ne '') { $routingMethod = 'Bullseye' }
+    $members = @()
+    if ($QueueMembers.ContainsKey($qid)) { $members = @($QueueMembers[$qid]) }
+    $sharedWith = @{}
+    foreach ($uid in $members) {
+        foreach ($oq in @($QueuesByUser[$uid])) { if ($oq -ne $qid) { if (-not $sharedWith.ContainsKey($oq)) { $sharedWith[$oq] = 0 }; $sharedWith[$oq]++ } }
+    }
+    $sharedText = @()
+    foreach ($oq in @($sharedWith.Keys)) { $sharedText += ('{0} ({1} shared agents)' -f $QueueNameMap[$oq], $sharedWith[$oq]) }
+    # skills actually requested by this queue's calls, and how many members hold each
+    $reqSkills = @{}
+    $reqLangs = @{}
+    $prioSeen = @{}
+    foreach ($a in $attempts) {
+        if ($a.QueueId -ne $qid) { continue }
+        foreach ($sid in $a.SkillIds) { $reqSkills[$sid] = $true }
+        if ($a.LanguageId -ne '') { $reqLangs[$a.LanguageId] = $true }
+        $pk = 'blank'
+        if ($a.Priority -ne $null) { $pk = [string]$a.Priority }
+        if (-not $prioSeen.ContainsKey($pk)) { $prioSeen[$pk] = 0 }
+        $prioSeen[$pk]++
+    }
+    $coverage = @()
+    foreach ($sid in @($reqSkills.Keys)) {
+        $n = 0
+        foreach ($uid in $members) { if ($Users[$uid].SkillIds -contains $sid) { $n++ } }
+        $coverage += ('{0}: {1}/{2} members' -f (Get-SkillName $sid), $n, $members.Count)
+    }
+    foreach ($lid in @($reqLangs.Keys)) {
+        $n = 0
+        foreach ($uid in $members) { if ($Users[$uid].LanguageIds -contains $lid) { $n++ } }
+        $coverage += ('language {0}: {1}/{2} members' -f (Get-LanguageName $lid), $n, $members.Count)
+    }
+    $prioText = @()
+    foreach ($pk in @($prioSeen.Keys | Sort-Object)) { $prioText += ('{0} x{1}' -f $pk, $prioSeen[$pk]) }
+    $configRows += (New-Object PSObject -Property @{
+        QueueName               = $QueueNameMap[$qid]
+        QueueId                 = $qid
+        ScoringMethod           = $scoring
+        SkillEvaluationMethod   = $skillEval
+        RoutingMethod           = $routingMethod
+        BullseyeRules           = $routingRules
+        ServiceLevelTarget      = $sla
+        AfterCallWork           = $acw
+        Members                 = $members.Count
+        SharedAgentsWithQueues  = ($sharedText -join ' | ')
+        PrioritiesSeenOnCalls   = ($prioText -join ', ')
+        RequestedSkillCoverage  = ($coverage -join ' | ')
+        Warning                 = ''
+    })
+}
+# warnings: mixed scoring methods among queues that share agents, priority not set, skill scarcity
+$allScoring = @{}
+foreach ($qid in @($scoringByQueue.Keys)) { $allScoring[$scoringByQueue[$qid]] = $true }
+foreach ($cr in $configRows) {
+    $w = @()
+    if ($cr.SharedAgentsWithQueues -ne '' -and $allScoring.Count -gt 1) { $w += 'queues sharing agents use different scoring methods - Priority-score (TimestampAndPriority) queues are served before Conversation-score queues regardless of priority value' }
+    if ($cr.ScoringMethod -notlike '*TimestampAndPriority*' -and $cr.ScoringMethod -notlike 'unknown*') { $w += ('scoring method is ' + $cr.ScoringMethod + ' (not Priority score)') }
+    if ($cr.PrioritiesSeenOnCalls -like '*blank*' -or $cr.PrioritiesSeenOnCalls -like '0 x*' -or $cr.PrioritiesSeenOnCalls -like '*, 0 x*') { $w += 'some calls reached this queue with priority 0/blank - check every flow path sets the priority' }
+    if ($cr.PrioritiesSeenOnCalls.Contains(',')) { $w += 'more than one priority value seen in this queue' }
+    if ($cr.RequestedSkillCoverage -like '*: 0/*' -or $cr.RequestedSkillCoverage -like '*: 1/*') { $w += 'a requested skill/language is held by 0 or 1 member' }
+    if ($cr.RoutingMethod -eq 'Bullseye') { $w += 'bullseye rings delay offers to outer-ring agents by design' }
+    $cr.Warning = ($w -join ' | ')
+}
+$configRows | Sort-Object -Property QueueName | Select-Object QueueName, ScoringMethod, SkillEvaluationMethod, RoutingMethod, BullseyeRules, Members, SharedAgentsWithQueues, PrioritiesSeenOnCalls, RequestedSkillCoverage, ServiceLevelTarget, AfterCallWork, Warning, QueueId | Export-Csv -Path $QueueConfigPath -NoTypeInformation -Encoding UTF8
+
+# ---- 6b. agent / queue matrix ---------------------------------------------------------------------------
+$agentRows = @()
+foreach ($uid in @($QueuesByUser.Keys)) {
+    $u = $Users[$uid]
+    $qn = @()
+    foreach ($qid in @($QueuesByUser[$uid])) { $qn += $QueueNameMap[$qid] }
+    $onQueueSec = 0
+    $idleSec = 0
+    if ($StatusByUser.ContainsKey($uid)) {
+        foreach ($iv in @($StatusByUser[$uid])) {
+            $s0 = $iv.Start; $e0 = $iv.End
+            if ($s0 -lt $StartUtc) { $s0 = $StartUtc }
+            if ($e0 -eq $null -or $e0 -gt $EndUtc) { $e0 = $EndUtc }
+            if ($e0 -le $s0) { continue }
+            $len = ($e0 - $s0).TotalSeconds
+            if ($iv.Status -ne 'OFF_QUEUE' -and $iv.Status -ne 'UNKNOWN') { $onQueueSec += $len }
+            if ($iv.Status -eq 'IDLE') { $idleSec += $len }
+        }
+    }
+    $answeredCount = @($attempts | Where-Object { $_.AnsweredBy -eq $uid }).Count
+    $agentRows += (New-Object PSObject -Property @{
+        Agent               = $u.Name
+        UserId              = $uid
+        State               = $u.State
+        QueueCount          = @($QueuesByUser[$uid]).Count
+        Queues              = (($qn | Sort-Object) -join '; ')
+        Skills              = $u.SkillText
+        Languages           = $u.LanguageText
+        OnQueueHoursInWindow = ('{0:N1}' -f ($onQueueSec / 3600))
+        IdleHoursInWindow   = ('{0:N1}' -f ($idleSec / 3600))
+        CallsAnsweredInWindow = $answeredCount
+    })
+}
+$agentRows | Sort-Object -Property Agent | Select-Object Agent, State, QueueCount, Queues, Skills, Languages, OnQueueHoursInWindow, IdleHoursInWindow, CallsAnsweredInWindow, UserId | Export-Csv -Path $AgentQueuesPath -NoTypeInformation -Encoding UTF8
+
+# ---- 6c. priority distribution per queue -------------------------------------------------------------
+$pbq = @{}
+foreach ($a in $attempts) {
+    $pk = 'blank'
+    if ($a.Priority -ne $null) { $pk = [string]$a.Priority }
+    $key = $a.QueueId + '|' + $pk
+    if (-not $pbq.ContainsKey($key)) { $pbq[$key] = @() }
+    $pbq[$key] += $a
+}
+$pbqRows = @()
+foreach ($key in @($pbq.Keys)) {
+    $grp = @($pbq[$key])
+    $qid = $key.Substring(0, $key.IndexOf('|'))
+    $pk = $key.Substring($key.IndexOf('|') + 1)
+    $waits = @($grp | ForEach-Object { [int]$_.WaitSeconds } | Sort-Object)
+    $ans = @($grp | Where-Object { $_.Outcome -eq 'Answered' })
+    $abd = @($grp | Where-Object { $_.Outcome -eq 'Abandoned' })
+    $avg = 0
+    if ($waits.Count -gt 0) { $avg = [int](($waits | Measure-Object -Average).Average) }
+    $p50 = 0; $p80 = 0; $p95 = 0; $max = 0
+    if ($waits.Count -gt 0) {
+        $p50 = $waits[[int](($waits.Count - 1) * 0.5)]
+        $p80 = $waits[[int](($waits.Count - 1) * 0.8)]
+        $p95 = $waits[[int](($waits.Count - 1) * 0.95)]
+        $max = $waits[$waits.Count - 1]
+    }
+    $within20 = @($ans | Where-Object { [int]$_.WaitSeconds -le 20 }).Count
+    $pct20 = 0
+    if ($grp.Count -gt 0) { $pct20 = [int](100 * $within20 / $grp.Count) }
+    $pbqRows += (New-Object PSObject -Property @{
+        QueueName        = $QueueNameMap[$qid]
+        Priority         = $pk
+        Calls            = $grp.Count
+        Answered         = $ans.Count
+        Abandoned        = $abd.Count
+        AvgWaitSec       = $avg
+        MedianWaitSec    = $p50
+        P80WaitSec       = $p80
+        P95WaitSec       = $p95
+        MaxWaitSec       = $max
+        PctAnsweredWithin20s = $pct20
+        PrioritySortKey  = $(if ($pk -eq 'blank') { -1 } else { [int]$pk })
+    })
+}
+$pbqRows | Sort-Object -Property QueueName, PrioritySortKey | Select-Object QueueName, Priority, Calls, Answered, Abandoned, PctAnsweredWithin20s, AvgWaitSec, MedianWaitSec, P80WaitSec, P95WaitSec, MaxWaitSec | Export-Csv -Path $PriorityByQueuePath -NoTypeInformation -Encoding UTF8
+
+# ---- 6d. cross-queue agent decision audit (the Priority-score test) --------------------------------------
+# For every offer to an agent: what was waiting, at that instant, in EVERY queue that agent belongs to and is
+# eligible for? Under Priority score the call taken must have the highest priority, then the longest wait.
+$decisions = @()
+$answeredAttempts = @($sorted | Where-Object { $_.AnsweredBy -ne '' -and $_.AnswerTime -ne $null })
+$decisionCounter = 0
+foreach ($a in $answeredAttempts) {
+    $decisionCounter++
+    if (($decisionCounter % 50) -eq 0) { Write-Progress -Activity 'Agent decision audit' -Status ("{0} / {1}" -f $decisionCounter, $answeredAttempts.Count) -PercentComplete ([int](100 * $decisionCounter / $answeredAttempts.Count)) }
+    $uid = $a.AnsweredBy
+    $tDec = $a.AnswerTime
+    if ($a.AlertStart -ne $null) { $tDec = $a.AlertStart }     # the routing decision is made when the agent is alerted
+    $agentQueues = @()
+    if ($QueuesByUser.ContainsKey($uid)) { $agentQueues = @($QueuesByUser[$uid]) }
+    $u = $Users[$uid]
+    $considered = @()
+    $notEligible = 0
+    $otherQueues = 0
+    $beingOffered = 0
+    $best = $null
+    foreach ($o in $sorted) {
+        if ($o.QueueStart -ge $tDec) { break }
+        if ($o.QueueEnd -le $tDec) { continue }
+        if ($o.ConversationId -eq $a.ConversationId -and $o.AttemptNo -eq $a.AttemptNo) { continue }
+        if ($o.AlertStart -ne $null -and $o.AlertStart -le $tDec) { $beingOffered++; continue }   # already assigned to another agent
+        if (-not ($agentQueues -contains $o.QueueId)) { $otherQueues++; continue }
+        if (-not (Test-AgentEligible -User $u -SkillIds $o.SkillIds -LanguageId $o.LanguageId)) { $notEligible++; continue }
+        $considered += $o
+        if ($o.Priority -eq $null) { continue }
+        if ($best -eq $null) { $best = $o; continue }
+        if ($o.Priority -gt $best.Priority -or ($o.Priority -eq $best.Priority -and $o.QueueStart -lt $best.QueueStart)) { $best = $o }
+    }
+    $verdict = 'NO OTHER CALL WAITING'
+    $shouldHave = ''
+    if ($considered.Count -gt 0) {
+        if ($a.Priority -eq $null -or $best -eq $null) { $verdict = 'UNKNOWN (priority missing)' }
+        elseif ($best.Priority -gt $a.Priority) { $verdict = 'WRONG ORDER - higher priority call was waiting' }
+        elseif ($best.Priority -eq $a.Priority -and $best.QueueStart -lt $a.QueueStart) { $verdict = 'WRONG ORDER - same priority, older call was waiting' }
+        else { $verdict = 'CORRECT' }
+        if ($verdict -like 'WRONG*') { $shouldHave = ('{0} in {1} (prio {2}, entered {3}, had waited {4}s)' -f $best.ConversationId, $QueueNameMap[$best.QueueId], $best.Priority, (Format-LocalTime $best.QueueStart), (Get-SecondsBetween $best.QueueStart $tDec)) }
+    }
+    $consText = @()
+    foreach ($o in $considered) { $consText += ('{0}|{1}|prio {2}|entered {3}' -f $o.ConversationId, $QueueNameMap[$o.QueueId], $o.Priority, (Format-LocalTime $o.QueueStart)) }
+    $decisions += (New-Object PSObject -Property @{
+        DecisionTimeLocal           = (Format-LocalTime $tDec)
+        Agent                       = $u.Name
+        AgentQueues                 = (@($agentQueues | ForEach-Object { $QueueNameMap[$_] } | Sort-Object) -join '; ')
+        TakenConversationId         = $a.ConversationId
+        TakenQueue                  = $QueueNameMap[$a.QueueId]
+        TakenPriority               = $a.Priority
+        TakenEnteredQueueLocal      = (Format-LocalTime $a.QueueStart)
+        TakenHadWaitedSeconds       = (Get-SecondsBetween $a.QueueStart $tDec)
+        Verdict                     = $verdict
+        ShouldHaveTaken             = $shouldHave
+        EligibleCallsWaitingInAgentQueues = $considered.Count
+        WaitingButAgentNotEligible  = $notEligible
+        WaitingInQueuesAgentNotMemberOf = $otherQueues
+        WaitingButAlreadyOfferedToAnotherAgent = $beingOffered
+        EligibleWaitingDetail       = ($consText -join ' || ')
+        SortKey                     = $tDec
+    })
+}
+Write-Progress -Activity 'Agent decision audit' -Completed
+$decisionColumns = @('DecisionTimeLocal', 'Agent', 'Verdict', 'TakenConversationId', 'TakenQueue', 'TakenPriority', 'TakenEnteredQueueLocal', 'TakenHadWaitedSeconds', 'ShouldHaveTaken', 'EligibleCallsWaitingInAgentQueues', 'WaitingButAgentNotEligible', 'WaitingInQueuesAgentNotMemberOf', 'WaitingButAlreadyOfferedToAnotherAgent', 'AgentQueues', 'EligibleWaitingDetail')
+if ($decisions.Count -gt 0) { $decisions | Sort-Object -Property SortKey | Select-Object $decisionColumns | Export-Csv -Path $DecisionsPath -NoTypeInformation -Encoding UTF8 }
+else { Set-Content -Path $DecisionsPath -Value ('"' + ($decisionColumns -join '","') + '"') -Encoding UTF8 }
+$decCorrect = @($decisions | Where-Object { $_.Verdict -eq 'CORRECT' })
+$decWrong = @($decisions | Where-Object { $_.Verdict -like 'WRONG*' })
+$decNone = @($decisions | Where-Object { $_.Verdict -eq 'NO OTHER CALL WAITING' })
+
+# endregion
+
 $honoured = @($events | Where-Object { $_.Verdict -eq 'PRIORITY HONOURED' })
 $violated = @($events | Where-Object { $_.Verdict -eq 'PRIORITY VIOLATED' })
 $violatedElig = @($violated | Where-Object { $_.AnsweringAgentEligibleForWaiting -eq $true })
@@ -1258,9 +1552,25 @@ Write-Host 'Priority evidence (same queue, pairs of "answered call" vs "call sti
 Write-Host ('  PRIORITY HONOURED : {0}  (higher-priority call answered ahead of an older lower-priority call)' -f $honoured.Count)
 Write-Host ('  PRIORITY VIOLATED : {0}  (lower-priority call answered while a higher-priority call waited; {1} by an agent eligible for the waiting call)' -f $violated.Count, $violatedElig.Count)
 Write-Host ('  FIFO VIOLATED     : {0}  (same priority, younger call answered first)' -f $fifo.Count)
+Write-Host ''
+Write-Host 'Agent decision audit (cross-queue, every offer to an agent vs everything waiting in that agent''s queues):'
+Write-Host ('  CORRECT               : {0}' -f $decCorrect.Count)
+Write-Host ('  WRONG ORDER           : {0}' -f $decWrong.Count)
+Write-Host ('  no other call waiting : {0}' -f $decNone.Count)
+$cfgWarn = @($configRows | Where-Object { $_.Warning -ne '' })
+if ($cfgWarn.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'Queue configuration warnings:'
+    foreach ($cr in $cfgWarn) { Write-Host ('  {0}: {1}' -f $cr.QueueName, $cr.Warning) }
+}
+Write-Host ''
 Write-Host ('API calls made      : {0}' -f $script:ApiCallCount)
 Write-Host ('CSV written         : {0}' -f $OutputPath)
-Write-Host ('Events CSV written  : {0}' -f $EventsOutputPath)
+Write-Host ('Events CSV          : {0}' -f $EventsOutputPath)
+Write-Host ('Queue config CSV    : {0}' -f $QueueConfigPath)
+Write-Host ('Agent/queue CSV     : {0}' -f $AgentQueuesPath)
+Write-Host ('Priority by queue   : {0}' -f $PriorityByQueuePath)
+Write-Host ('Agent decisions CSV : {0}' -f $DecisionsPath)
 Write-Host '========================================='
 Write-Host 'Tip: filter ReviewFlag = REVIEW and read ReviewReason / JumpedAheadDetail first. See README.md for how to interpret the columns.'
 

@@ -82,6 +82,7 @@ Useful options
 | `-ChunkHours` | 24 | analytics query window size (keeps every query inside API limits) |
 | `-MaxNamesPerCell` | 15 | cap for agent-name lists in a cell |
 | `-EventsOutputPath` | `<OutputPath>_PriorityEvents.csv` | where the priority event log CSV is written |
+| (automatic) | `<OutputPath>_AgentDecisions.csv`, `_QueueConfig.csv`, `_AgentQueues.csv`, `_PriorityByQueue.csv` | troubleshooting CSVs, see section 4 |
 | `-ClientId` / `-ClientSecret` | embedded values | override the credentials embedded at the top of the script |
 
 Runtime: one `GET /api/v2/conversations/{id}` per call is needed for the priority, so a busy division
@@ -132,6 +133,8 @@ Status comes from the analytics routing-status history, so it is exactly what Ge
 |---|---|
 | `SecondsAnEligibleAgentWasIdleDuringWait` | number of seconds during the wait when **at least one eligible member was Idle** |
 | `LongestEligibleIdleStretchSeconds` | longest continuous such stretch. 1–5 s blips are normal (that is the platform picking and alerting an agent); tens of seconds while the call waits is not |
+| `FirstEligibleAgentFreeLocal`, `WaitUntilEligibleAgentFreeSeconds` | the first moment after queue entry that any eligible member was Idle, and how long the call had waited by then. This part of the wait is **capacity**: nobody who could take the call was free. `none during wait` means no eligible agent freed up at all before the call left the queue. |
+| `WaitAfterEligibleAgentFreeSeconds` | how much longer the call waited *after* an eligible agent was free. Under Priority score this should be a few seconds (offer + ring). Tens of seconds means the free agent was given something else (see the agent decision audit) or did not answer. |
 
 ### Other calls
 | Column | Meaning |
@@ -174,6 +177,72 @@ explaining the most likely non-priority cause when one is visible.
 The console summary prints the totals of each verdict, so a healthy queue reads e.g.
 `PRIORITY HONOURED: 57, PRIORITY VIOLATED: 0`.
 
+---
+
+## 4. Troubleshooting reports (shared agents across queues, Priority score)
+
+When agents are members of several queues (e.g. AU RAS 800, AU/NZ CB 400, AU/NZ ROS 100) the
+comparison that matters is **across queues**: when an agent became free, did they get the highest-priority
+call waiting in *any* of their queues? Four extra CSVs are written next to the main report for that.
+
+### `…_AgentDecisions.csv` – the definitive Priority-score test
+One row per offer to an agent. At the instant the agent was alerted, the script collects every call that
+was waiting in **every queue that agent is a member of**, that the agent was **eligible** for (skills /
+language), and that had **not already been offered to someone else**. Under Priority score
+(*Timestamp and priority*) the call taken must be the highest priority among those, and the oldest on a tie.
+
+| Column | Meaning |
+|---|---|
+| `Verdict` | `CORRECT`, `NO OTHER CALL WAITING`, `WRONG ORDER - higher priority call was waiting`, `WRONG ORDER - same priority, older call was waiting`, or `UNKNOWN (priority missing)` |
+| `Agent`, `AgentQueues`, `DecisionTimeLocal` | who, their queues, and when they were alerted |
+| `TakenConversationId`, `TakenQueue`, `TakenPriority`, `TakenEnteredQueueLocal`, `TakenHadWaitedSeconds` | the call they got |
+| `ShouldHaveTaken` | on a wrong order: the call, queue, priority, entry time and wait of the call that should have gone first |
+| `EligibleCallsWaitingInAgentQueues`, `EligibleWaitingDetail` | what the platform had to choose from |
+| `WaitingButAgentNotEligible` | calls waiting in the agent's queues that they lacked the skills/language for (explains "idle agent, waiting call") |
+| `WaitingInQueuesAgentNotMemberOf` | calls waiting elsewhere in the division – invisible to this agent by design |
+| `WaitingButAlreadyOfferedToAnotherAgent` | calls that were already ringing at another agent |
+
+The console prints `CORRECT / WRONG ORDER / no other call waiting` totals. **Zero WRONG ORDER rows over a
+busy week is the proof that priority works.** Each WRONG ORDER row carries both conversation ids for a
+support case. Membership is as of today, so an agent added to or removed from a queue after the date range
+can produce a false verdict for that agent; check `…_AgentQueues.csv` when in doubt.
+
+### `…_QueueConfig.csv` – configuration audit
+Per queue: `ScoringMethod` (`TimestampAndPriority` = Priority score, `ConversationScore`),
+`SkillEvaluationMethod` (`BEST` = best available skills, `ALL`, `NONE`), `RoutingMethod`
+(Standard or Bullseye with the ring rules), service level target, after-call-work setting, member count,
+`SharedAgentsWithQueues` (which other queues share how many agents), `PrioritiesSeenOnCalls` (every
+priority value that actually reached this queue, with counts) and `RequestedSkillCoverage` (for each skill
+or language the queue's calls asked for, how many members hold it).
+
+`Warning` is filled when:
+* queues that share agents use **different scoring methods** – Genesys serves Priority-score queues before
+  Conversation-score queues regardless of the priority value, which silently breaks the 800/400/100 order;
+* a queue is not on Priority score;
+* calls reached the queue with priority **0 or blank**, or with more than one value – a flow path that does
+  not set the priority is the most common real cause of "priority is not working";
+* a requested skill or language is held by 0 or 1 member;
+* bullseye rings are configured (outer-ring agents are deliberately withheld).
+
+### `…_AgentQueues.csv` – agent / queue matrix
+One row per agent who is a member of any of the queues: their queues, skills with proficiency, languages,
+on-queue and idle hours in the window, and calls answered. Use it to see who is actually shared between the
+priority queues and whether the RAS/CB skills sit with only a couple of people.
+
+### `…_PriorityByQueue.csv` – priority distribution and wait profile
+One row per queue per priority value: calls, answered, abandoned, % answered within 20 s, average, median,
+80th and 95th percentile and maximum wait. Every AU RAS row should say 800, every CB row 400, every ROS row
+100. Compare the *percentiles* of the 800 band against the 400 band during the same period rather than the
+averages: with few agents, one long call dominates an average.
+
+### How to read them together
+1. `…_QueueConfig.csv`: fix anything in `Warning` first. No point analysing routing on a mixed configuration.
+2. `…_PriorityByQueue.csv`: confirm every queue only ever sees its intended priority value.
+3. `…_AgentDecisions.csv`: filter `Verdict` starting with `WRONG`. If it is empty, priority is working and
+   the remaining wait is capacity or skills.
+4. Main report, `WaitUntilEligibleAgentFreeSeconds` vs `WaitAfterEligibleAgentFreeSeconds` on the long
+   800/400 waits: the first number is staffing, the second is routing or agent behaviour.
+
 ### `ReviewFlag` / `ReviewReason`
 A row is flagged when any of these is true:
 * a lower/later-priority call was answered by an **eligible** agent while this call waited (strong evidence of a priority problem),
@@ -184,8 +253,12 @@ A row is flagged when any of these is true:
 
 ---
 
-## 4. How Genesys priority actually works (things that look like bugs but are not)
+## 5. How Genesys priority actually works (things that look like bugs but are not)
 
+0. **Scoring method decides what "priority" means.** *Timestamp and priority* (Priority score): highest
+   priority always first, waiting time only breaks ties. *Conversation score*: each priority point is a
+   one-minute head start, so a lower-priority call that has waited long enough overtakes. Queues that
+   share agents must use the same method – Priority-score queues are served first when mixed.
 1. **Priority only orders the queue.** A higher priority never pulls an agent off an interaction and never
    interrupts after-call work. If everybody eligible is `Interacting`, the priority call waits.
 2. **Skills and language trump priority.** An Idle agent without the requested skills/language is invisible
@@ -213,7 +286,7 @@ Genesys Cloud support case quoting the `ConversationId` values.
 
 ---
 
-## 5. Test harness (development only)
+## 6. Test harness (development only)
 
 `tests/mock-genesys-server.js` is a tiny Node.js mock of the endpoints used, with a scenario whose
 expected numbers are known. `tests/Run-MockTest.ps1` runs the report against it under
