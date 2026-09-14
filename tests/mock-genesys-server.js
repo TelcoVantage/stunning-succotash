@@ -20,6 +20,8 @@ const A = 'user-a', B = 'user-b', C = 'user-c';
 // c7: prio 400, no skill, enters 10:20:10, answered by A 10:20:20  -> overtakes c6 = PRIORITY HONOURED
 // c8: prio 800, Q2 (AU RAS), enters 10:40:00, answered by A 10:45:00 (alert 10:44:58)
 // c9: prio 400, Q1, enters 10:40:05, alerted to A 10:40:10, answered 10:40:12 -> A took a 400 while an 800 waited in Q2 = WRONG ORDER
+// c10: prio 400, Q1, enters 10:52:00, alerted to C 10:52:02-10:52:22 (RONA, C goes NOT_RESPONDING), then A 10:52:23, answered 10:52:25
+// c11: prio 100, Q1, enters 10:56:00, alerted to B 10:56:01, customer hangs up while ringing 10:56:08 (abandoned, NOT a RONA)
 const T = (hms) => `2026-09-02T${hms}.000Z`;
 
 function seg(type, start, end, extra) { return Object.assign({ segmentType: type, segmentStart: T(start), segmentEnd: T(end) }, extra || {}); }
@@ -33,6 +35,11 @@ function conv(id, start, end, acdSeg, acdSession, agentParts) {
       ...agentParts
     ]
   };
+}
+function agentAlertOnly(uid, alertStart, alertEnd, disc, rona) {
+  const sess = { mediaType: 'voice', direction: 'inbound', segments: [seg('alert', alertStart, alertEnd, { disconnectType: disc })] };
+  if (rona) sess.metrics = [{ name: 'tNotResponding', value: 20000, emitDate: T(alertEnd) }];
+  return { participantId: uid + '-p-' + alertStart, purpose: 'agent', userId: uid, sessions: [sess] };
 }
 function agent(uid, alertStart, answer, end) {
   return { participantId: uid + '-p', purpose: 'agent', userId: uid, sessions: [{ mediaType: 'voice', direction: 'inbound', segments: [seg('alert', alertStart, answer), seg('interact', answer, end), seg('wrapup', end, end)] }] };
@@ -48,8 +55,10 @@ const conversations = [
   conv('c7', '10:20:10', '10:25:00', seg('interact', '10:20:10', '10:20:20', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:20:18', '10:20:20', '10:25:00')]),
   conv('c8', '10:40:00', '10:50:00', seg('interact', '10:40:00', '10:45:00', { queueId: Q2, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:44:58', '10:45:00', '10:50:00')]),
   conv('c9', '10:40:05', '10:44:00', seg('interact', '10:40:05', '10:40:12', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agent(A, '10:40:10', '10:40:12', '10:44:00')]),
+  conv('c10', '10:52:00', '10:55:00', seg('interact', '10:52:00', '10:52:25', { queueId: Q1, disconnectType: 'transfer' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agentAlertOnly(C, '10:52:02', '10:52:22', 'timeout', true), agent(A, '10:52:23', '10:52:25', '10:55:00')]),
+  conv('c11', '10:56:00', '10:56:08', seg('interact', '10:56:00', '10:56:08', { queueId: Q1, disconnectType: 'client' }), { usedRouting: 'Standard', requestedRoutings: ['Standard'] }, [agentAlertOnly(B, '10:56:01', '10:56:08', 'peer', false)]),
 ];
-const priorities = { c1: 0, c2: 5, c3: 0, c4: 0, c6: 100, c7: 400, c8: 800, c9: 400 }; // c5 -> 404
+const priorities = { c1: 0, c2: 5, c3: 0, c4: 0, c6: 100, c7: 400, c8: 800, c9: 400, c10: 400, c11: 100 }; // c5 -> 404
 const queueOf = { c8: Q2 };
 
 function convDetail(id) {
@@ -69,9 +78,9 @@ const users = {
 };
 function rs(status, start, end) { return { routingStatus: status, startTime: T(start), endTime: end ? T(end) : undefined }; }
 const routing = {
-  [A]: [rs('IDLE', '09:00:00', '10:00:02'), rs('INTERACTING', '10:00:02', '10:05:00'), rs('IDLE', '10:05:00', '10:10:00'), rs('INTERACTING', '10:10:00', '10:20:18'), rs('IDLE', '10:20:18', '10:20:19'), rs('INTERACTING', '10:20:19', '10:25:00'), rs('IDLE', '10:25:00', '10:30:00'), rs('OFF_QUEUE', '10:30:00', '10:39:00'), rs('INTERACTING', '10:39:00', '10:44:00'), rs('IDLE', '10:44:00', '10:44:58'), rs('INTERACTING', '10:44:58', '10:50:00'), rs('OFF_QUEUE', '10:50:00', null)],
-  [B]: [rs('IDLE', '10:00:00', '10:00:58'), rs('INTERACTING', '10:00:58', '10:01:50'), rs('IDLE', '10:01:50', '10:01:57'), rs('INTERACTING', '10:01:57', '10:06:00'), rs('OFF_QUEUE', '10:06:00', null)],
-  [C]: [rs('IDLE', '09:30:00', '10:15:00'), rs('INTERACTING', '10:15:00', '10:20:37'), rs('IDLE', '10:20:37', '10:20:39'), rs('INTERACTING', '10:20:39', '10:30:00'), rs('OFF_QUEUE', '10:30:00', null)],
+  [A]: [rs('IDLE', '09:00:00', '10:00:02'), rs('INTERACTING', '10:00:02', '10:05:00'), rs('IDLE', '10:05:00', '10:10:00'), rs('INTERACTING', '10:10:00', '10:20:18'), rs('IDLE', '10:20:18', '10:20:19'), rs('INTERACTING', '10:20:19', '10:25:00'), rs('IDLE', '10:25:00', '10:30:00'), rs('OFF_QUEUE', '10:30:00', '10:39:00'), rs('INTERACTING', '10:39:00', '10:44:00'), rs('IDLE', '10:44:00', '10:44:58'), rs('INTERACTING', '10:44:58', '10:50:00'), rs('OFF_QUEUE', '10:50:00', '10:52:23'), rs('INTERACTING', '10:52:23', '10:55:00'), rs('OFF_QUEUE', '10:55:00', null)],
+  [B]: [rs('IDLE', '10:00:00', '10:00:58'), rs('INTERACTING', '10:00:58', '10:01:50'), rs('IDLE', '10:01:50', '10:01:57'), rs('INTERACTING', '10:01:57', '10:06:00'), rs('OFF_QUEUE', '10:06:00', '10:55:00'), rs('IDLE', '10:55:00', '10:56:01'), rs('INTERACTING', '10:56:01', '10:56:08'), rs('IDLE', '10:56:08', '11:00:00'), rs('OFF_QUEUE', '11:00:00', null)],
+  [C]: [rs('IDLE', '09:30:00', '10:15:00'), rs('INTERACTING', '10:15:00', '10:20:37'), rs('IDLE', '10:20:37', '10:20:39'), rs('INTERACTING', '10:20:39', '10:30:00'), rs('OFF_QUEUE', '10:30:00', '10:51:00'), rs('IDLE', '10:51:00', '10:52:02'), rs('INTERACTING', '10:52:02', '10:52:22'), rs('NOT_RESPONDING', '10:52:22', '10:53:00'), rs('OFF_QUEUE', '10:53:00', null)],
 };
 
 let hits = {};

@@ -82,7 +82,7 @@ Useful options
 | `-ChunkHours` | 24 | analytics query window size (keeps every query inside API limits) |
 | `-MaxNamesPerCell` | 15 | cap for agent-name lists in a cell |
 | `-EventsOutputPath` | `<OutputPath>_PriorityEvents.csv` | where the priority event log CSV is written |
-| (automatic) | `<OutputPath>_AgentDecisions.csv`, `_QueueConfig.csv`, `_AgentQueues.csv`, `_PriorityByQueue.csv` | troubleshooting CSVs, see section 4 |
+| (automatic) | `<OutputPath>_AgentDecisions.csv`, `_QueueConfig.csv`, `_AgentQueues.csv`, `_PriorityByQueue.csv`, `_AlertsNoAnswer.csv` | troubleshooting CSVs, see section 4 |
 | `-ClientId` / `-ClientSecret` | embedded values | override the credentials embedded at the top of the script |
 
 Runtime: one `GET /api/v2/conversations/{id}` per call is needed for the priority, so a busy division
@@ -112,7 +112,10 @@ section below) and filter on `Verdict`.
 | `QueueEntryTimeLocal`, `QueueExitTimeLocal`, `WaitSeconds` | time in queue |
 | `Outcome` | `Answered`, `Abandoned`, `FlowOut (…)` (queue timeout → voicemail/callback/other flow) or `NotAnswered (disconnectType)` |
 | `AnsweredBy`, `AnswerTimeLocal`, `FirstAlertTimeLocal`, `AlertToAnswerSeconds` | who answered and how long it rang |
-| `OfferedButNotAnsweredBy` | agents the call was alerted to who did not pick up (RONA / declined) |
+| `AlertsNotAnswered` | ring attempts during this wait that did not end in that agent answering (any reason) |
+| `AlertsNotAnsweredByAgent` | of those, the ones attributable to the agent: RONA (confirmed by the agent going *Not Responding* or the `tNotResponding` metric), alert timeout, or declined. Only these raise the review flag. |
+| `AlertsAbandonedWhileRinging` | of those, the ones where the **customer hung up while the phone was ringing** at the agent. Not the agent's fault, and not a routing fault: the call was offered. |
+| `AlertsNoAnswerDetail` | `Agent (classification, rang Ns from HH:MM:SS)` for each such alert. The full list with all evidence is in `…_AlertsNoAnswer.csv` (section 4). |
 
 ### Agents at the moment the call entered the queue (`…AtEntry`)
 Counts are over the queue's **current** members (Genesys does not keep historical membership).
@@ -235,6 +238,26 @@ One row per queue per priority value: calls, answered, abandoned, % answered wit
 100. Compare the *percentiles* of the 800 band against the 400 band during the same period rather than the
 averages: with few agents, one long call dominates an average.
 
+### `…_AlertsNoAnswer.csv` – every ring attempt that did not end in an answer
+One row per alert segment (ring at an agent) that did not lead to that agent answering. Each row shows the
+call, queue, priority, agent, alert start/end and ring seconds, and a `Classification` built from three
+pieces of evidence: the alert segment's own `AlertDisconnectType`, the agent's routing status two seconds
+after the alert ended (`AgentStatusAfterAlert`, `NOT_RESPONDING` = confirmed RONA) and whether the
+agent's session carries the `tNotResponding` metric.
+
+| `Classification` | Meaning |
+|---|---|
+| `RONA - agent did not answer (confirmed)` | agent went Not Responding, or the session has the not-responding metric |
+| `RONA - alert timed out` | alert ended with disconnect type `timeout` but no status corroboration (agent probably on a queue without RONA status change) |
+| `Declined / ended by agent` | alert ended from the agent side before the timeout |
+| `Customer abandoned while ringing` | the call left the queue as abandoned at the moment the alert ended: the caller hung up during the ring |
+| `Call left the queue (flow-out) while ringing` | queue timeout / in-queue flow moved the call while it rang |
+| `Alert ended without answer (…)` | none of the above; the raw disconnect type is shown |
+
+Only the first three count against agents (`AlertsNotAnsweredByAgent` on the main report and the review
+flag). An alert that starts after the call was answered (transfer, consult) or belongs to the next queue
+attempt of the same conversation is not listed here.
+
 ### How to read them together
 1. `…_QueueConfig.csv`: fix anything in `Warning` first. No point analysing routing on a mixed configuration.
 2. `…_PriorityByQueue.csv`: confirm every queue only ever sees its intended priority value.
@@ -248,8 +271,8 @@ A row is flagged when any of these is true:
 * a lower/later-priority call was answered by an **eligible** agent while this call waited (strong evidence of a priority problem),
 * a lower/later-priority call was answered first but by a **non-eligible** agent (usually skills/language, not priority),
 * an eligible agent was Idle for at least `-FlagIdleStretchSeconds` continuously while this call waited,
-* the call was offered to agents who did not answer,
-* the call abandoned while eligible agents were Idle at queue entry.
+* the call was offered to an agent who did not answer it (RONA / declined; a customer hanging up while it rang does not count),
+* the call abandoned without ever being offered to an agent while eligible agents were Idle at queue entry.
 
 ---
 

@@ -14,7 +14,9 @@ $out = Join-Path $here 'mock-output.csv'
 #           Agent decisions CSV: 1 CORRECT (Alice took c7/400 while c6/100 waited), 2 WRONG ORDER (Bob took c3/0 while
 #           c2/5 waited; Alice took c9/400 in Customer Service Line while c8/800 waited in AU RAS).
 #           Queue config CSV: AU RAS flagged (ConversationScore while the shared queue is TimestampAndPriority, bullseye).
+#           Alerts no answer CSV: c10 Carol = RONA confirmed (timeout + NOT_RESPONDING), c11 Bob = customer abandoned while ringing.
 Import-Csv $out | Select-Object ConversationId, Priority, ReviewFlag, WaitSeconds, AgentsIdleAndEligibleAtEntry, AnsweredBeforeThisCallConversationIds, OvertookLowerPriorityCalls, HigherPriorityCallsServedFirst, CallsJumpedAheadByEligibleAgent, PriorityEvidence | Format-Table -AutoSize
 Import-Csv (Join-Path $here 'mock-output_PriorityEvents.csv') | Select-Object Verdict, AnsweredConversationId, AnsweredPriority, AnsweredAtLocal, WaitingConversationId, WaitingPriority, WaitingEnteredQueueLocal, AnsweringAgentEligibleForWaiting | Format-Table -AutoSize
 Import-Csv (Join-Path $here 'mock-output_AgentDecisions.csv') | Select-Object DecisionTimeLocal, Agent, Verdict, TakenConversationId, TakenPriority, ShouldHaveTaken | Format-Table -AutoSize
+Import-Csv (Join-Path $here 'mock-output_AlertsNoAnswer.csv') | Select-Object ConversationId, Agent, AlertStartLocal, RingSeconds, Classification, AlertDisconnectType, AgentStatusAfterAlert | Format-Table -AutoSize
 Import-Csv (Join-Path $here 'mock-output_QueueConfig.csv') | Select-Object QueueName, ScoringMethod, SkillEvaluationMethod, RoutingMethod, Members, SharedAgentsWithQueues, Warning | Format-Table -AutoSize

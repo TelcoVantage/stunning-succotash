@@ -566,12 +566,18 @@ foreach ($convId in $conversationsById.Keys) {
             elseif ($purpose -eq 'agent' -or $purpose -eq 'user') {
                 $uid = [string]$p.userId
                 if ($uid -eq '') { continue }
+                $sessRona = $false
+                foreach ($m in @($sess.metrics)) { if ([string]$m.name -eq 'tNotResponding') { $sessRona = $true } }
                 foreach ($seg in @($sess.segments)) {
+                    $sd = ''
+                    if ($seg.disconnectType -ne $null) { $sd = [string]$seg.disconnectType }
                     $agentSegments += (New-Object PSObject -Property @{
-                        UserId = $uid
-                        Type   = [string]$seg.segmentType
-                        Start  = (ConvertTo-UtcDate $seg.segmentStart)
-                        End    = (ConvertTo-UtcDate $seg.segmentEnd)
+                        UserId   = $uid
+                        Type     = [string]$seg.segmentType
+                        Start    = (ConvertTo-UtcDate $seg.segmentStart)
+                        End      = (ConvertTo-UtcDate $seg.segmentEnd)
+                        Disc     = $sd
+                        SessRona = $sessRona
                     })
                 }
             }
@@ -632,11 +638,25 @@ foreach ($convId in $conversationsById.Keys) {
             if ($handleEnd -eq $null -and $answerTime -ne $null) { $handleEnd = $convEnd }
             if ($handleEnd -eq $null -and $answerTime -ne $null) { $handleEnd = $answerTime }
 
-            # Agents alerted during the wait who did NOT answer (RONA / declined)
+            # Alerts (ring attempts) during THIS queue wait that did not end in that agent answering.
+            # Rules: the alert must start inside the wait (before the answer, if any); an alert counts as answered
+            # when the same agent has an 'interact' segment starting between the alert start and alert end (+3s).
+            $alertsNoAnswer = @()
+            $waitEndForAlerts = $qe.AddSeconds(2)
+            if ($answerTime -ne $null -and $answerTime -lt $waitEndForAlerts) { $waitEndForAlerts = $answerTime }
             foreach ($as in $agentSegments) {
                 if ($as.Type -ne 'alert' -or $as.Start -eq $null) { continue }
-                if ($as.Start -lt $qs.AddSeconds(-1) -or $as.Start -gt $limit) { continue }
-                if ($as.UserId -ne $answeredBy) { $offeredNotAnswered[$as.UserId] = $true }
+                if ($as.Start -lt $qs.AddSeconds(-1) -or $as.Start -ge $waitEndForAlerts) { continue }
+                $answeredFromThisAlert = $false
+                foreach ($is in $agentSegments) {
+                    if ($is.UserId -ne $as.UserId -or $is.Type -ne 'interact' -or $is.Start -eq $null) { continue }
+                    if ($is.Start -lt $as.Start) { continue }
+                    if ($as.End -ne $null -and $is.Start -gt $as.End.AddSeconds(3)) { continue }
+                    $answeredFromThisAlert = $true
+                }
+                if ($answeredFromThisAlert) { continue }
+                $alertsNoAnswer += (New-Object PSObject -Property @{ UserId = $as.UserId; Start = $as.Start; End = $as.End; Disc = $as.Disc; SessRona = $as.SessRona })
+                $offeredNotAnswered[$as.UserId] = $true
             }
             if ($answeredBy -ne '') { $agentIds[$answeredBy] = $true }
             foreach ($k in $offeredNotAnswered.Keys) { $agentIds[$k] = $true }
@@ -680,6 +700,7 @@ foreach ($convId in $conversationsById.Keys) {
                 AlertStart         = $alertStart
                 HandleEnd          = $handleEnd
                 OfferedNotAnswered = @($offeredNotAnswered.Keys)
+                AlertsNoAnswer     = $alertsNoAnswer
                 SkillIds           = $skillIds
                 LanguageId         = $langId
                 UsedRouting        = $usedRouting
@@ -932,6 +953,7 @@ foreach ($a in $sorted) {
 
 $rows = @()
 $events = @()
+$alertRows = @()
 $rowCounter = 0
 for ($idx = 0; $idx -lt $sorted.Count; $idx++) {
     $a = $sorted[$idx]
@@ -1121,20 +1143,62 @@ for ($idx = 0; $idx -lt $sorted.Count; $idx++) {
         }
     }
 
+    # ---- alerts that did not end in an answer: classify each one -----------------------------------
+    $alertTexts = @()
+    $ronaCount = 0
+    $abandonedWhileRinging = 0
+    foreach ($al in @($a.AlertsNoAnswer)) {
+        $ring = ''
+        if ($al.End -ne $null) { $ring = Get-SecondsBetween $al.Start $al.End }
+        $statusAfter = ''
+        $notRespondingAfter = $false
+        if ($al.End -ne $null -and $StatusByUser.ContainsKey($al.UserId)) {
+            $statusAfter = Get-StatusAt -Intervals $StatusByUser[$al.UserId] -T $al.End.AddSeconds(2)
+            if ($statusAfter -eq 'NOT_RESPONDING') { $notRespondingAfter = $true }
+        }
+        $endedWithCall = $false
+        if ($al.End -ne $null -and (Get-AbsSeconds $al.End $a.QueueEnd) -le 3) { $endedWithCall = $true }
+        $class = ''
+        if ($a.AnsweredBy -eq '' -and $a.Outcome -eq 'Abandoned' -and $endedWithCall) { $class = 'Customer abandoned while ringing'; $abandonedWhileRinging++ }
+        elseif ($a.AnsweredBy -eq '' -and $a.Outcome -like 'FlowOut*' -and $endedWithCall) { $class = 'Call left the queue (flow-out) while ringing' }
+        elseif ($notRespondingAfter -or $al.SessRona) { $class = 'RONA - agent did not answer (confirmed)'; $ronaCount++ }
+        elseif ($al.Disc -eq 'timeout') { $class = 'RONA - alert timed out'; $ronaCount++ }
+        elseif ($al.Disc -eq 'client' -or $al.Disc -eq 'endpoint') { $class = 'Declined / ended by agent'; $ronaCount++ }
+        else { $class = 'Alert ended without answer (' + $al.Disc + ')'; $ronaCount++ }
+        $alertTexts += ('{0} ({1}, rang {2}s from {3})' -f (Get-UserName $al.UserId), $class, $ring, (Format-LocalTime $al.Start))
+        $alertRows += (New-Object PSObject -Property @{
+            ConversationId        = $a.ConversationId
+            QueueName             = $QueueNameMap[$a.QueueId]
+            Priority              = $(if ($a.Priority -ne $null) { $a.Priority } else { '' })
+            Agent                 = (Get-UserName $al.UserId)
+            AlertStartLocal       = (Format-LocalTime $al.Start)
+            AlertEndLocal         = (Format-LocalTime $al.End)
+            RingSeconds           = $ring
+            Classification        = $class
+            AlertDisconnectType   = $al.Disc
+            AgentStatusAfterAlert = $statusAfter
+            NotRespondingMetricOnSession = $al.SessRona
+            QueueEntryTimeLocal   = (Format-LocalTime $a.QueueStart)
+            WaitSeconds           = $a.WaitSeconds
+            CallOutcome           = $a.Outcome
+            AnsweredBy            = (Get-UserName $a.AnsweredBy)
+            AnswerTimeLocal       = (Format-LocalTime $a.AnswerTime)
+            SortKey               = $al.Start
+        })
+    }
+
     # ---- review flag -----------------------------------------------------------------------------
     $reasons = @()
     if ($jumpedEligible -gt 0) { $reasons += ('{0} lower/later-priority call(s) answered by an eligible agent while this call waited' -f $jumpedEligible) }
     elseif ($jumped.Count -gt 0) { $reasons += ('{0} lower/later-priority call(s) answered first (by agents NOT eligible for this call - check skills/language)' -f $jumped.Count) }
     if ($haveMemberData -and $coverage.LongestSeconds -ge $FlagIdleStretchSeconds) { $reasons += ('an eligible agent was Idle for {0}s continuously while this call waited' -f $coverage.LongestSeconds) }
-    if ($a.OfferedNotAnswered.Count -gt 0) { $reasons += ('offered to {0} agent(s) who did not answer' -f $a.OfferedNotAnswered.Count) }
-    if ($haveMemberData -and $a.Outcome -eq 'Abandoned' -and $idleEligible -gt 0) { $reasons += 'abandoned although eligible agents were Idle at queue entry' }
+    if ($ronaCount -gt 0) { $reasons += ('{0} alert(s) not answered by the agent (RONA/declined) - see AlertsNoAnswerDetail' -f $ronaCount) }
+    if ($haveMemberData -and $a.Outcome -eq 'Abandoned' -and $idleEligible -gt 0 -and @($a.AlertsNoAnswer).Count -eq 0 -and $a.AlertStart -eq $null) { $reasons += 'abandoned without ever being offered to an agent although eligible agents were Idle at queue entry' }
     $flag = ''
     if ($reasons.Count -gt 0) { $flag = 'REVIEW' }
 
     $skillNamesText = @()
     foreach ($sid in $a.SkillIds) { $skillNamesText += (Get-SkillName $sid) }
-    $ronaNames = @()
-    foreach ($uid in $a.OfferedNotAnswered) { $ronaNames += (Get-UserName $uid) }
 
     $prioText = ''
     if ($a.Priority -ne $null) { $prioText = $a.Priority }
@@ -1167,7 +1231,10 @@ for ($idx = 0; $idx -lt $sorted.Count; $idx++) {
         AnswerTimeLocal                         = (Format-LocalTime $a.AnswerTime)
         FirstAlertTimeLocal                     = (Format-LocalTime $a.AlertStart)
         AlertToAnswerSeconds                    = (Get-SecondsBetween $a.AlertStart $a.AnswerTime)
-        OfferedButNotAnsweredBy                 = (Join-Capped $ronaNames $MaxNamesPerCell)
+        AlertsNotAnswered                       = @($a.AlertsNoAnswer).Count
+        AlertsNotAnsweredByAgent                = $ronaCount
+        AlertsAbandonedWhileRinging             = $abandonedWhileRinging
+        AlertsNoAnswerDetail                    = (Join-Capped $alertTexts $MaxNamesPerCell)
         QueueMembersTotal                       = $members.Count
         AgentsOnQueueAtEntry                    = $(if ($haveMemberData) { $onQueue } else { $na })
         AgentsIdleAtEntry                       = $(if ($haveMemberData) { $idle } else { $na })
@@ -1219,7 +1286,8 @@ $columns = @(
     'QueueName', 'QueueAttempt', 'Priority', 'PrioritySource',
     'RequestedSkills', 'RequestedLanguage', 'RoutingMethodUsed', 'RoutingMethodsRequested', 'BullseyeRing', 'PreferredAgents',
     'QueueEntryTimeLocal', 'QueueExitTimeLocal', 'WaitSeconds', 'Outcome',
-    'AnsweredBy', 'AnswerTimeLocal', 'FirstAlertTimeLocal', 'AlertToAnswerSeconds', 'OfferedButNotAnsweredBy',
+    'AnsweredBy', 'AnswerTimeLocal', 'FirstAlertTimeLocal', 'AlertToAnswerSeconds',
+    'AlertsNotAnswered', 'AlertsNotAnsweredByAgent', 'AlertsAbandonedWhileRinging', 'AlertsNoAnswerDetail',
     'QueueMembersTotal', 'AgentsOnQueueAtEntry', 'AgentsIdleAtEntry', 'AgentsIdleAndEligibleAtEntry',
     'IdleEligibleAgentNamesAtEntry', 'IdleAgentNamesAtEntry',
     'AgentsInteractingAtEntry', 'AgentsCommunicatingAtEntry', 'AgentsNotRespondingAtEntry', 'AgentsStatusUnknownAtEntry',
@@ -1520,6 +1588,14 @@ Write-Progress -Activity 'Agent decision audit' -Completed
 $decisionColumns = @('DecisionTimeLocal', 'Agent', 'Verdict', 'TakenConversationId', 'TakenQueue', 'TakenPriority', 'TakenEnteredQueueLocal', 'TakenHadWaitedSeconds', 'ShouldHaveTaken', 'EligibleCallsWaitingInAgentQueues', 'WaitingButAgentNotEligible', 'WaitingInQueuesAgentNotMemberOf', 'WaitingButAlreadyOfferedToAnotherAgent', 'AgentQueues', 'EligibleWaitingDetail')
 if ($decisions.Count -gt 0) { $decisions | Sort-Object -Property SortKey | Select-Object $decisionColumns | Export-Csv -Path $DecisionsPath -NoTypeInformation -Encoding UTF8 }
 else { Set-Content -Path $DecisionsPath -Value ('"' + ($decisionColumns -join '","') + '"') -Encoding UTF8 }
+# ---- 6e. every alert that did not end in an answer ---------------------------------------------------------
+$AlertsPath = Get-CompanionPath '_AlertsNoAnswer'
+$alertColumns = @('ConversationId', 'QueueName', 'Priority', 'Agent', 'AlertStartLocal', 'AlertEndLocal', 'RingSeconds', 'Classification', 'AlertDisconnectType', 'AgentStatusAfterAlert', 'NotRespondingMetricOnSession', 'QueueEntryTimeLocal', 'WaitSeconds', 'CallOutcome', 'AnsweredBy', 'AnswerTimeLocal')
+if ($alertRows.Count -gt 0) { $alertRows | Sort-Object -Property SortKey | Select-Object $alertColumns | Export-Csv -Path $AlertsPath -NoTypeInformation -Encoding UTF8 }
+else { Set-Content -Path $AlertsPath -Value ('"' + ($alertColumns -join '","') + '"') -Encoding UTF8 }
+$alertRona = @($alertRows | Where-Object { $_.Classification -like 'RONA*' -or $_.Classification -like 'Declined*' -or $_.Classification -like 'Alert ended*' })
+$alertAbandoned = @($alertRows | Where-Object { $_.Classification -like 'Customer abandoned*' -or $_.Classification -like 'Call left*' })
+
 $decCorrect = @($decisions | Where-Object { $_.Verdict -eq 'CORRECT' })
 $decWrong = @($decisions | Where-Object { $_.Verdict -like 'WRONG*' })
 $decNone = @($decisions | Where-Object { $_.Verdict -eq 'NO OTHER CALL WAITING' })
@@ -1557,6 +1633,10 @@ Write-Host 'Agent decision audit (cross-queue, every offer to an agent vs everyt
 Write-Host ('  CORRECT               : {0}' -f $decCorrect.Count)
 Write-Host ('  WRONG ORDER           : {0}' -f $decWrong.Count)
 Write-Host ('  no other call waiting : {0}' -f $decNone.Count)
+Write-Host ''
+Write-Host 'Alerts that did not end in an answer:'
+Write-Host ('  agent did not answer / declined : {0}' -f $alertRona.Count)
+Write-Host ('  customer hung up while ringing  : {0}' -f $alertAbandoned.Count)
 $cfgWarn = @($configRows | Where-Object { $_.Warning -ne '' })
 if ($cfgWarn.Count -gt 0) {
     Write-Host ''
@@ -1571,6 +1651,7 @@ Write-Host ('Queue config CSV    : {0}' -f $QueueConfigPath)
 Write-Host ('Agent/queue CSV     : {0}' -f $AgentQueuesPath)
 Write-Host ('Priority by queue   : {0}' -f $PriorityByQueuePath)
 Write-Host ('Agent decisions CSV : {0}' -f $DecisionsPath)
+Write-Host ('Alerts no answer CSV: {0}' -f $AlertsPath)
 Write-Host '========================================='
 Write-Host 'Tip: filter ReviewFlag = REVIEW and read ReviewReason / JumpedAheadDetail first. See README.md for how to interpret the columns.'
 
